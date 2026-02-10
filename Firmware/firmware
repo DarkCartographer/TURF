@@ -1,0 +1,844 @@
+/*
+ * RoboMow Firmware
+ * For ESP32 or Arduino-compatible boards
+ * 
+ * Hardware Requirements:
+ * - ESP32/ESP8266 (for WiFi) or Arduino with WiFi shield
+ * - 2x DC Motors (left and right wheels)
+ * - Motor driver (L298N or similar)
+ * - 3x GPS modules (for triangulation) OR IMU for navigation
+ * - Blade motor
+ * - Battery voltage sensor
+ * - Charging dock sensor (IR or magnetic)
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+
+// ====== CONFIGURATION ======
+// TODO: Update these with your WiFi credentials
+const char* WIFI_SSID = "YourWiFiName";        // Change to your WiFi network name
+const char* WIFI_PASSWORD = "YourWiFiPassword"; // Change to your WiFi password
+
+// ====== PIN CONFIGURATION ======
+// TODO: Update these pin numbers based on your actual wiring
+// Use pins that match your motor driver and ESP32/Arduino board
+
+// Left Motor Control Pins
+#define MOTOR_LEFT_PWM    0    // PWM pin for left motor speed control (must be PWM-capable)
+#define MOTOR_LEFT_DIR1   0    // Direction control pin 1 for left motor
+#define MOTOR_LEFT_DIR2   0    // Direction control pin 2 for left motor
+
+// Right Motor Control Pins
+#define MOTOR_RIGHT_PWM   0    // PWM pin for right motor speed control (must be PWM-capable)
+#define MOTOR_RIGHT_DIR1  0    // Direction control pin 1 for right motor
+#define MOTOR_RIGHT_DIR2  0    // Direction control pin 2 for right motor
+
+// Blade Motor Control
+#define BLADE_MOTOR_PIN   0    // Pin to control blade motor (via relay or MOSFET)
+
+// Sensor Pins
+#define BATTERY_SENSOR_PIN 0   // Analog input pin for battery voltage sensor (must be ADC-capable)
+#define DOCK_SENSOR_PIN    0   // Digital/analog input for charging dock detection sensor
+
+// GPS/Position Pins (if using actual GPS modules)
+// #define GPS1_RX  0    // Serial RX pin for GPS module 1
+// #define GPS1_TX  0    // Serial TX pin for GPS module 1
+// #define GPS2_RX  0    // Serial RX pin for GPS module 2
+// #define GPS2_TX  0    // Serial TX pin for GPS module 2
+// #define GPS3_RX  0    // Serial RX pin for GPS module 3
+// #define GPS3_TX  0    // Serial TX pin for GPS module 3
+
+// IMU Pins (if using IMU for navigation)
+// #define IMU_SDA  0    // I2C SDA pin for IMU (MPU6050, etc.)
+// #define IMU_SCL  0    // I2C SCL pin for IMU
+
+// Optional: Additional Sensor Pins
+// #define ULTRASONIC_TRIG 0   // Ultrasonic sensor trigger pin (obstacle detection)
+// #define ULTRASONIC_ECHO 0   // Ultrasonic sensor echo pin
+// #define RAIN_SENSOR     0   // Rain detection sensor pin
+// #define TILT_SENSOR     0   // Tilt/flip detection sensor pin
+// #define LEFT_ENCODER    0   // Left wheel encoder pin
+// #define RIGHT_ENCODER   0   // Right wheel encoder pin
+
+// NOTE: For ESP32, recommended PWM pins are: 25, 26, 27, 32, 33
+// NOTE: For ESP32, ADC pins are: 32-39 (avoid 34-39 if using WiFi for best stability)
+// NOTE: Avoid using pins 6-11 on ESP32 (used for flash memory)
+
+// ====== GLOBAL VARIABLES ======
+WebServer server(80);
+
+// Field Configuration
+struct FieldConfig {
+  bool configured = false;
+  float width = 0;      // meters
+  float height = 0;     // meters
+  // Anchors (for real GPS triangulation)
+  float anchor1_x = 0, anchor1_y = 0;
+  float anchor2_x = 0, anchor2_y = 0;
+  float anchor3_x = 0, anchor3_y = 0;
+} field;
+
+// Robot State
+struct RobotState {
+  // Dead Reckoning Position
+  float x_dr = 0;           // Dead reckoning X position (meters)
+  float y_dr = 0;           // Dead reckoning Y position (meters)
+  
+  // Triangulated Position
+  float x_tri = 0;          // Triangulated X position (meters)
+  float y_tri = 0;          // Triangulated Y position (meters)
+  
+  // Current Position (fusion of both)
+  float x = 0;              // Current best estimate X (meters)
+  float y = 0;              // Current best estimate Y (meters)
+  
+  float heading = 0;        // Current heading (degrees, 0=right, 90=down)
+  bool isMowing = false;
+  bool isCharging = false;
+  float batteryLevel = 100;
+  int mowingProgress = 0;
+  int mowedArea = 0;
+  int remainingArea = 0;
+  float totalDistance = 0;
+  unsigned long runtimeMillis = 0;
+  bool emergencyStop = false;
+  bool positionWarning = false;  // True if DR and triangulation disagree
+  float positionError = 0;       // Distance between DR and triangulation
+} robot;
+
+// Distance measurements from anchors (in meters)
+// These would come from UWB modules, GPS, or other ranging sensors
+struct AnchorDistances {
+  float dist1 = 0;  // Distance to anchor 1 (top-left)
+  float dist2 = 0;  // Distance to anchor 2 (top-right)
+  float dist3 = 0;  // Distance to anchor 3 (bottom-left)
+  unsigned long lastUpdate = 0;
+  bool valid = false;
+} anchorDist;
+
+// Movement parameters
+const float WHEEL_BASE = 0.4;        // Distance between wheels (meters)
+const float WHEEL_DIAMETER = 0.15;   // Wheel diameter (meters)
+const float SPEED_NORMAL = 0.3;      // Normal speed (m/s)
+const float POSITION_TOLERANCE = 0.1; // Position tolerance (meters)
+const float POSITION_ERROR_THRESHOLD = 0.5; // Max acceptable error between DR and triangulation (meters)
+
+// ====== SETUP ======
+void setup() {
+  Serial.begin(115200);
+  Serial.println("RoboMow Firmware Starting...");
+
+  // Initialize motor pins
+  pinMode(MOTOR_LEFT_PWM, OUTPUT);
+  pinMode(MOTOR_LEFT_DIR1, OUTPUT);
+  pinMode(MOTOR_LEFT_DIR2, OUTPUT);
+  pinMode(MOTOR_RIGHT_PWM, OUTPUT);
+  pinMode(MOTOR_RIGHT_DIR1, OUTPUT);
+  pinMode(MOTOR_RIGHT_DIR2, OUTPUT);
+  pinMode(BLADE_MOTOR_PIN, OUTPUT);
+
+  // Initialize sensors
+  pinMode(BATTERY_SENSOR_PIN, INPUT);
+  pinMode(DOCK_SENSOR_PIN, INPUT);
+
+  // Stop all motors initially
+  stopMotors();
+
+  // Connect to WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("Connected! IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Setup web server routes
+  setupServerRoutes();
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+// ====== MAIN LOOP ======
+void loop() {
+  server.handleClient();
+
+  // Update robot state
+  updateBattery();
+  updateDeadReckoning();
+  
+  // Update triangulated position from anchor distances
+  if (field.configured && anchorDist.valid) {
+    updateTriangulatedPosition();
+    comparePositions();  // Compare dead reckoning vs triangulation
+    fusePositions();     // Combine both for best estimate
+  }
+
+  // Check for emergency stop
+  if (robot.emergencyStop) {
+    stopMotors();
+    stopBlade();
+    robot.isMowing = false;
+    return;
+  }
+
+  // Check if charging
+  if (isOnDock()) {
+    robot.isCharging = true;
+    robot.isMowing = false;
+    stopMotors();
+    stopBlade();
+    return;
+  } else {
+    robot.isCharging = false;
+  }
+
+  // Auto return to dock if battery low
+  if (robot.batteryLevel < 20 && !robot.isCharging) {
+    Serial.println("Low battery - returning to dock");
+    returnToDock();
+    return;
+  }
+
+  // Execute mowing pattern if active
+  if (robot.isMowing && field.configured) {
+    executeMowingPattern();
+  }
+
+  delay(50); // Small delay to prevent overwhelming the system
+}
+
+// ====== WEB SERVER ROUTES ======
+void setupServerRoutes() {
+  // Enable CORS
+  server.enableCORS(true);
+
+  // Status endpoint
+  server.on("/api/status", HTTP_GET, handleStatus);
+
+  // Command endpoint
+  server.on("/api/command", HTTP_POST, handleCommand);
+
+  // Field configuration endpoint
+  server.on("/api/field-config", HTTP_POST, handleFieldConfig);
+
+  // Handle OPTIONS for CORS
+  server.on("/api/status", HTTP_OPTIONS, handleCORS);
+  server.on("/api/command", HTTP_OPTIONS, handleCORS);
+  server.on("/api/field-config", HTTP_OPTIONS, handleCORS);
+}
+
+void handleCORS() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  server.send(200);
+}
+
+void handleStatus() {
+  StaticJsonDocument<768> doc;
+
+  doc["isMowing"] = robot.isMowing;
+  doc["batteryLevel"] = robot.batteryLevel;
+  doc["batteryMinutes"] = (int)(robot.batteryLevel * 1.2); // Estimate
+  doc["mowingProgress"] = robot.mowingProgress;
+  doc["mowedArea"] = robot.mowedArea;
+  doc["remainingArea"] = robot.remainingArea;
+  doc["totalArea"] = (int)(field.width * field.height);
+  doc["totalDistance"] = robot.totalDistance;
+  doc["runtimeHours"] = robot.runtimeMillis / 3600000;
+  doc["runtimeMinutes"] = (robot.runtimeMillis % 3600000) / 60000;
+  doc["nextChargeMinutes"] = (int)(robot.batteryLevel * 1.2);
+
+  // Add position if field configured
+  if (field.configured) {
+    JsonObject position = doc.createNestedObject("position");
+    position["x"] = robot.x;
+    position["y"] = robot.y;
+    
+    // Add debug info about positioning
+    JsonObject posDebug = doc.createNestedObject("positionDebug");
+    posDebug["x_deadReckoning"] = robot.x_dr;
+    posDebug["y_deadReckoning"] = robot.y_dr;
+    posDebug["x_triangulated"] = robot.x_tri;
+    posDebug["y_triangulated"] = robot.y_tri;
+    posDebug["positionError"] = robot.positionError;
+    posDebug["positionWarning"] = robot.positionWarning;
+    posDebug["triangulationValid"] = anchorDist.valid;
+  }
+
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handleCommand() {
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, server.arg("plain"));
+
+  if (error) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid JSON\"}");
+    return;
+  }
+
+  const char* command = doc["command"];
+
+  if (strcmp(command, "emergency_stop") == 0) {
+    robot.emergencyStop = true;
+    robot.isMowing = false;
+    stopMotors();
+    stopBlade();
+    Serial.println("EMERGENCY STOP");
+    server.send(200, "application/json", "{\"success\":true,\"message\":\"Emergency stop executed\"}");
+  }
+  else if (strcmp(command, "pause") == 0) {
+    robot.isMowing = false;
+    stopMotors();
+    stopBlade();
+    Serial.println("Mowing paused");
+    server.send(200, "application/json", "{\"success\":true,\"message\":\"Mowing paused\"}");
+  }
+  else if (strcmp(command, "resume") == 0) {
+    robot.emergencyStop = false;
+    robot.isMowing = true;
+    startBlade();
+    Serial.println("Mowing resumed");
+    server.send(200, "application/json", "{\"success\":true,\"message\":\"Mowing resumed\"}");
+  }
+  else {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"Unknown command\"}");
+  }
+}
+
+void handleFieldConfig() {
+  StaticJsonDocument<1024> doc;
+  DeserializationError error = deserializeJson(doc, server.arg("plain"));
+
+  if (error) {
+    server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid JSON\"}");
+    return;
+  }
+
+  // Extract field dimensions
+  field.width = doc["dimensions"]["width"];
+  field.height = doc["dimensions"]["height"];
+
+  // Extract anchor positions
+  JsonArray anchors = doc["anchors"];
+  for (JsonObject anchor : anchors) {
+    const char* corner = anchor["corner"];
+    float x = anchor["x"];
+    float y = anchor["y"];
+
+    if (strcmp(corner, "TL") == 0) {
+      field.anchor1_x = x;
+      field.anchor1_y = y;
+    } else if (strcmp(corner, "TR") == 0) {
+      field.anchor2_x = x;
+      field.anchor2_y = y;
+    } else if (strcmp(corner, "BL") == 0) {
+      field.anchor3_x = x;
+      field.anchor3_y = y;
+    }
+  }
+
+  field.configured = true;
+
+  // Reset robot to origin
+  robot.x = 0;
+  robot.y = 0;
+  robot.x_dr = 0;
+  robot.y_dr = 0;
+  robot.x_tri = 0;
+  robot.y_tri = 0;
+  robot.heading = 0;
+  robot.mowingProgress = 0;
+  robot.mowedArea = 0;
+  robot.remainingArea = (int)(field.width * field.height);
+  robot.positionWarning = false;
+  robot.positionError = 0;
+
+  Serial.println("Field configured:");
+  Serial.printf("  Size: %.1f x %.1f meters\n", field.width, field.height);
+  Serial.printf("  Anchor 1 (TL): (%.1f, %.1f)\n", field.anchor1_x, field.anchor1_y);
+  Serial.printf("  Anchor 2 (TR): (%.1f, %.1f)\n", field.anchor2_x, field.anchor2_y);
+  Serial.printf("  Anchor 3 (BL): (%.1f, %.1f)\n", field.anchor3_x, field.anchor3_y);
+
+  server.send(200, "application/json", "{\"success\":true,\"message\":\"Field configured successfully\"}");
+}
+
+// ====== MOTOR CONTROL ======
+void setMotorSpeed(int leftSpeed, int rightSpeed) {
+  // Left motor
+  if (leftSpeed > 0) {
+    digitalWrite(MOTOR_LEFT_DIR1, HIGH);
+    digitalWrite(MOTOR_LEFT_DIR2, LOW);
+    analogWrite(MOTOR_LEFT_PWM, constrain(leftSpeed, 0, 255));
+  } else if (leftSpeed < 0) {
+    digitalWrite(MOTOR_LEFT_DIR1, LOW);
+    digitalWrite(MOTOR_LEFT_DIR2, HIGH);
+    analogWrite(MOTOR_LEFT_PWM, constrain(-leftSpeed, 0, 255));
+  } else {
+    digitalWrite(MOTOR_LEFT_DIR1, LOW);
+    digitalWrite(MOTOR_LEFT_DIR2, LOW);
+    analogWrite(MOTOR_LEFT_PWM, 0);
+  }
+
+  // Right motor
+  if (rightSpeed > 0) {
+    digitalWrite(MOTOR_RIGHT_DIR1, HIGH);
+    digitalWrite(MOTOR_RIGHT_DIR2, LOW);
+    analogWrite(MOTOR_RIGHT_PWM, constrain(rightSpeed, 0, 255));
+  } else if (rightSpeed < 0) {
+    digitalWrite(MOTOR_RIGHT_DIR1, LOW);
+    digitalWrite(MOTOR_RIGHT_DIR2, HIGH);
+    analogWrite(MOTOR_RIGHT_PWM, constrain(-rightSpeed, 0, 255));
+  } else {
+    digitalWrite(MOTOR_RIGHT_DIR1, LOW);
+    digitalWrite(MOTOR_RIGHT_DIR2, LOW);
+    analogWrite(MOTOR_RIGHT_PWM, 0);
+  }
+}
+
+void moveForward(int speed = 200) {
+  setMotorSpeed(speed, speed);
+}
+
+void moveBackward(int speed = 200) {
+  setMotorSpeed(-speed, -speed);
+}
+
+void turnLeft(int speed = 150) {
+  setMotorSpeed(-speed, speed); // Left backward, right forward
+}
+
+void turnRight(int speed = 150) {
+  setMotorSpeed(speed, -speed); // Left forward, right backward
+}
+
+void stopMotors() {
+  setMotorSpeed(0, 0);
+}
+
+void startBlade() {
+  digitalWrite(BLADE_MOTOR_PIN, HIGH);
+  Serial.println("Blade started");
+}
+
+void stopBlade() {
+  digitalWrite(BLADE_MOTOR_PIN, LOW);
+  Serial.println("Blade stopped");
+}
+
+// ====== NAVIGATION ======
+void moveToPosition(float targetX, float targetY) {
+  Serial.printf("Moving to (%.2f, %.2f)\n", targetX, targetY);
+
+  while (true) {
+    // Calculate distance and angle to target
+    float dx = targetX - robot.x;
+    float dy = targetY - robot.y;
+    float distance = sqrt(dx * dx + dy * dy);
+
+    // Check if we've reached the target
+    if (distance < POSITION_TOLERANCE) {
+      stopMotors();
+      Serial.println("Target reached");
+      return;
+    }
+
+    // Calculate desired heading
+    float desiredHeading = atan2(dy, dx) * 180 / PI;
+    if (desiredHeading < 0) desiredHeading += 360;
+
+    // Calculate heading error
+    float headingError = desiredHeading - robot.heading;
+    if (headingError > 180) headingError -= 360;
+    if (headingError < -180) headingError += 360;
+
+    // Turn towards target if needed
+    if (abs(headingError) > 10) {
+      if (headingError > 0) {
+        turnRight(150);
+      } else {
+        turnLeft(150);
+      }
+      delay(100);
+      robot.heading += (headingError > 0 ? 5 : -5);
+      if (robot.heading < 0) robot.heading += 360;
+      if (robot.heading >= 360) robot.heading -= 360;
+    } else {
+      // Move forward
+      moveForward(200);
+      delay(100);
+
+      // Update position (simplified dead reckoning)
+      float moveDistance = SPEED_NORMAL * 0.1; // 0.1 second movement
+      robot.x_dr += moveDistance * cos(robot.heading * PI / 180);
+      robot.y_dr += moveDistance * sin(robot.heading * PI / 180);
+      robot.totalDistance += moveDistance / 1000; // Convert to km
+    }
+
+    // Allow server to handle requests
+    server.handleClient();
+
+    // Check for emergency stop
+    if (robot.emergencyStop || !robot.isMowing) {
+      stopMotors();
+      return;
+    }
+  }
+}
+
+// ====== DISTANCE MEASUREMENT FROM ANCHORS ======
+/*
+ * Function to read distances from ranging sensors (UWB, GPS, etc.)
+ * This should be called periodically to update anchor distances
+ * 
+ * Implementation depends on your ranging hardware:
+ * - UWB (Ultra-Wideband): DWM1000 modules
+ * - GPS: Calculate from GPS coordinates
+ * - Time-of-Flight: VL53L1X or similar
+ */
+void updateAnchorDistances() {
+  // TODO: Implement based on your ranging sensor hardware
+  
+  // Example for UWB modules (pseudo-code):
+  // anchorDist.dist1 = readUWB_Distance(ANCHOR1_ADDRESS);
+  // anchorDist.dist2 = readUWB_Distance(ANCHOR2_ADDRESS);
+  // anchorDist.dist3 = readUWB_Distance(ANCHOR3_ADDRESS);
+  
+  // Example for GPS (calculate distance from coordinates):
+  // float robotLat, robotLon;
+  // getGPSCoordinates(&robotLat, &robotLon);
+  // anchorDist.dist1 = calculateDistance(robotLat, robotLon, anchor1_lat, anchor1_lon);
+  // anchorDist.dist2 = calculateDistance(robotLat, robotLon, anchor2_lat, anchor2_lon);
+  // anchorDist.dist3 = calculateDistance(robotLat, robotLon, anchor3_lat, anchor3_lon);
+  
+  // For testing/simulation, you can calculate distances based on current position
+  if (field.configured) {
+    // Calculate theoretical distances for testing
+    float dx1 = robot.x_dr - field.anchor1_x;
+    float dy1 = robot.y_dr - field.anchor1_y;
+    anchorDist.dist1 = sqrt(dx1*dx1 + dy1*dy1);
+    
+    float dx2 = robot.x_dr - field.anchor2_x;
+    float dy2 = robot.y_dr - field.anchor2_y;
+    anchorDist.dist2 = sqrt(dx2*dx2 + dy2*dy2);
+    
+    float dx3 = robot.x_dr - field.anchor3_x;
+    float dy3 = robot.y_dr - field.anchor3_y;
+    anchorDist.dist3 = sqrt(dx3*dx3 + dy3*dy3);
+    
+    // Add some realistic noise to simulate real sensors
+    anchorDist.dist1 += random(-10, 10) / 100.0; // ±10cm noise
+    anchorDist.dist2 += random(-10, 10) / 100.0;
+    anchorDist.dist3 += random(-10, 10) / 100.0;
+    
+    anchorDist.valid = true;
+    anchorDist.lastUpdate = millis();
+  }
+  
+  // Invalidate distances if too old (sensor timeout)
+  if (millis() - anchorDist.lastUpdate > 5000) {
+    anchorDist.valid = false;
+  }
+}
+
+// ====== TRIANGULATION FROM THREE ANCHORS ======
+/*
+ * Calculate robot position using trilateration from 3 anchor points
+ * Given:
+ *   - 3 anchor positions: (x1,y1), (x2,y2), (x3,y3)
+ *   - 3 distances: d1, d2, d3
+ * Solve for robot position (x,y)
+ * 
+ * Method: Algebraic solution to circle intersection
+ */
+void updateTriangulatedPosition() {
+  if (!field.configured || !anchorDist.valid) {
+    return;
+  }
+  
+  // Get anchor positions
+  float x1 = field.anchor1_x, y1 = field.anchor1_y;
+  float x2 = field.anchor2_x, y2 = field.anchor2_y;
+  float x3 = field.anchor3_x, y3 = field.anchor3_y;
+  
+  // Get distances to each anchor
+  float r1 = anchorDist.dist1;
+  float r2 = anchorDist.dist2;
+  float r3 = anchorDist.dist3;
+  
+  // Translate so anchor1 is at origin
+  float x2_t = x2 - x1;
+  float y2_t = y2 - y1;
+  float x3_t = x3 - x1;
+  float y3_t = y3 - y1;
+  
+  // Calculate position using trilateration formulas
+  float d = sqrt(x2_t*x2_t + y2_t*y2_t);
+  
+  if (d < 0.01) {
+    Serial.println("Error: Anchors 1 and 2 too close together");
+    return;
+  }
+  
+  // Calculate i and j (unit vectors)
+  float i = (r1*r1 - r2*r2 + d*d) / (2*d);
+  
+  // Calculate j component
+  float term1 = (r1*r1 - r3*r3);
+  float term2 = x3_t*x3_t + y3_t*y3_t;
+  float term3 = 2*x3_t*i;
+  
+  float j_numerator = term1 + term2 - term3;
+  float j_denominator = 2*y3_t;
+  
+  if (abs(j_denominator) < 0.01) {
+    Serial.println("Error: Anchors are collinear");
+    return;
+  }
+  
+  float j = j_numerator / j_denominator;
+  
+  // Calculate x and y in translated coordinates
+  float x_t = i;
+  float y_t = j;
+  
+  // Translate back to original coordinate system
+  // Rotate and translate
+  float angle = atan2(y2_t, x2_t);
+  robot.x_tri = x1 + x_t * cos(angle) - y_t * sin(angle);
+  robot.y_tri = y1 + x_t * sin(angle) + y_t * cos(angle);
+  
+  // Sanity check - position should be within field bounds
+  if (robot.x_tri < -1 || robot.x_tri > field.width + 1 ||
+      robot.y_tri < -1 || robot.y_tri > field.height + 1) {
+    Serial.println("Warning: Triangulated position outside field bounds");
+    Serial.printf("  Calculated: (%.2f, %.2f)\n", robot.x_tri, robot.y_tri);
+  }
+  
+  Serial.printf("Triangulation: (%.2f, %.2f)\n", robot.x_tri, robot.y_tri);
+}
+
+// ====== POSITION COMPARISON & WARNING ======
+/*
+ * Compare dead reckoning position with triangulated position
+ * Issue warning if they disagree significantly
+ */
+void comparePositions() {
+  if (!field.configured || !anchorDist.valid) {
+    return;
+  }
+  
+  // Calculate error between dead reckoning and triangulation
+  float dx = robot.x_dr - robot.x_tri;
+  float dy = robot.y_dr - robot.y_tri;
+  robot.positionError = sqrt(dx*dx + dy*dy);
+  
+  // Check if error exceeds threshold
+  if (robot.positionError > POSITION_ERROR_THRESHOLD) {
+    robot.positionWarning = true;
+    
+    Serial.println("⚠️  POSITION WARNING ⚠️");
+    Serial.printf("Dead Reckoning: (%.2f, %.2f)\n", robot.x_dr, robot.y_dr);
+    Serial.printf("Triangulation:  (%.2f, %.2f)\n", robot.x_tri, robot.y_tri);
+    Serial.printf("Error: %.2f meters (threshold: %.2f)\n", 
+                  robot.positionError, POSITION_ERROR_THRESHOLD);
+    
+    // Possible causes of error
+    if (robot.positionError > 2.0) {
+      Serial.println("Possible causes:");
+      Serial.println("  - Wheels slipping");
+      Serial.println("  - Obstacle collision");
+      Serial.println("  - Sensor malfunction");
+      Serial.println("  - Incorrect field configuration");
+    }
+  } else {
+    robot.positionWarning = false;
+  }
+}
+
+// ====== POSITION FUSION ======
+/*
+ * Combine dead reckoning and triangulation for best position estimate
+ * Uses weighted average based on confidence in each method
+ */
+void fusePositions() {
+  if (!field.configured) {
+    robot.x = robot.x_dr;
+    robot.y = robot.y_dr;
+    return;
+  }
+  
+  if (!anchorDist.valid) {
+    // No triangulation available, use dead reckoning only
+    robot.x = robot.x_dr;
+    robot.y = robot.y_dr;
+    return;
+  }
+  
+  // Weight factors (adjust based on sensor confidence)
+  float dr_weight = 0.3;   // Dead reckoning weight
+  float tri_weight = 0.7;  // Triangulation weight
+  
+  // If position error is high, trust triangulation more
+  if (robot.positionError > POSITION_ERROR_THRESHOLD) {
+    dr_weight = 0.2;
+    tri_weight = 0.8;
+    
+    // Reset dead reckoning to match triangulation to prevent drift
+    robot.x_dr = robot.x_tri;
+    robot.y_dr = robot.y_tri;
+    
+    Serial.println("Position corrected using triangulation");
+  }
+  
+  // Fuse positions using weighted average
+  robot.x = robot.x_dr * dr_weight + robot.x_tri * tri_weight;
+  robot.y = robot.y_dr * dr_weight + robot.y_tri * tri_weight;
+}
+
+void returnToDock() {
+  Serial.println("Returning to charging dock at origin (0,0)");
+  robot.isMowing = false;
+  stopBlade();
+  moveToPosition(0, 0);
+  Serial.println("Arrived at dock");
+}
+
+// ====== MOWING PATTERN ======
+void executeMowingPattern() {
+  // Simple back-and-forth lawnmower pattern
+  static float currentY = 0;
+  static bool movingRight = true;
+  const float STRIPE_WIDTH = 0.4; // Width of each mowing stripe
+
+  if (currentY >= field.height) {
+    // Finished mowing
+    robot.isMowing = false;
+    robot.mowingProgress = 100;
+    stopBlade();
+    Serial.println("Mowing complete!");
+    returnToDock();
+    return;
+  }
+
+  // Move in stripes
+  if (movingRight) {
+    moveToPosition(field.width, currentY);
+    movingRight = false;
+  } else {
+    moveToPosition(0, currentY);
+    movingRight = true;
+    currentY += STRIPE_WIDTH;
+  }
+
+  // Update progress
+  robot.mowedArea = (int)(currentY * field.width);
+  robot.remainingArea = (int)(field.width * field.height) - robot.mowedArea;
+  robot.mowingProgress = (int)((currentY / field.height) * 100);
+}
+
+// ====== SENSORS ======
+void updateBattery() {
+  // Read battery voltage and convert to percentage
+  int rawValue = analogRead(BATTERY_SENSOR_PIN);
+  // Adjust this formula based on your battery and voltage divider
+  robot.batteryLevel = map(rawValue, 0, 4095, 0, 100);
+  robot.batteryLevel = constrain(robot.batteryLevel, 0, 100);
+
+  // Simulate battery drain when mowing
+  if (robot.isMowing) {
+    static unsigned long lastDrain = 0;
+    if (millis() - lastDrain > 10000) { // Drain every 10 seconds
+      robot.batteryLevel -= 0.5;
+      lastDrain = millis();
+    }
+  }
+}
+
+void updateDeadReckoning() {
+  // Update position based on motor movements (dead reckoning)
+  // This is a simplified version - add wheel encoders for better accuracy
+  
+  // Update runtime
+  if (robot.isMowing) {
+    robot.runtimeMillis = millis();
+  }
+  
+  // Update anchor distances periodically
+  static unsigned long lastDistUpdate = 0;
+  if (millis() - lastDistUpdate > 500) { // Update every 500ms
+    updateAnchorDistances();
+    lastDistUpdate = millis();
+  }
+}
+
+bool isOnDock() {
+  // Check if robot is on charging dock
+  // This could be IR sensor, magnetic sensor, or position-based
+  int sensorValue = digitalRead(DOCK_SENSOR_PIN);
+  return (sensorValue == HIGH && robot.x < 0.2 && robot.y < 0.2);
+}
+
+// ====== ADDITIONAL HELPER FUNCTIONS ======
+
+/*
+ * Calculate distance between two GPS coordinates (Haversine formula)
+ * Used if implementing GPS-based ranging
+ */
+float calculateGPSDistance(float lat1, float lon1, float lat2, float lon2) {
+  const float R = 6371000; // Earth radius in meters
+  
+  float phi1 = lat1 * PI / 180;
+  float phi2 = lat2 * PI / 180;
+  float deltaPhi = (lat2 - lat1) * PI / 180;
+  float deltaLambda = (lon2 - lon1) * PI / 180;
+  
+  float a = sin(deltaPhi/2) * sin(deltaPhi/2) +
+            cos(phi1) * cos(phi2) *
+            sin(deltaLambda/2) * sin(deltaLambda/2);
+  float c = 2 * atan2(sqrt(a), sqrt(1-a));
+  
+  return R * c; // Distance in meters
+}
+
+/*
+ * Example UWB distance reading (pseudo-code for DWM1000 modules)
+ * Replace with actual hardware implementation
+ */
+float readUWB_Distance(uint8_t anchorAddress) {
+  // TODO: Implement based on your UWB module
+  // Example for DWM1000:
+  // DW1000.newReceive();
+  // DW1000.setDefaults();
+  // DW1000.startReceive();
+  // ... wait for ranging result ...
+  // float distance = DW1000.getRange();
+  // return distance;
+  
+  return 0; // Placeholder
+}
+
+/*
+ * Diagnostic function to print positioning status
+ */
+void printPositionDiagnostics() {
+  Serial.println("========== POSITION DIAGNOSTICS ==========");
+  Serial.printf("Dead Reckoning: (%.3f, %.3f)\n", robot.x_dr, robot.y_dr);
+  Serial.printf("Triangulated:   (%.3f, %.3f)\n", robot.x_tri, robot.y_tri);
+  Serial.printf("Fused Position: (%.3f, %.3f)\n", robot.x, robot.y);
+  Serial.printf("Position Error: %.3f m\n", robot.positionError);
+  Serial.printf("Warning Active: %s\n", robot.positionWarning ? "YES" : "NO");
+  Serial.println();
+  Serial.printf("Anchor Distances: d1=%.3f, d2=%.3f, d3=%.3f\n", 
+                anchorDist.dist1, anchorDist.dist2, anchorDist.dist3);
+  Serial.printf("Triangulation Valid: %s\n", anchorDist.valid ? "YES" : "NO");
+  Serial.println("==========================================");
+}
