@@ -69,11 +69,28 @@ app.get('/api/status', (req, res) => {
     mowerState.batteryLevel = Math.max(0, mowerState.batteryLevel - 0.25);
   }
 
-  // Include position if field is configured
+  // Simulate position data
   if (fieldConfig) {
+    const width = parseFloat(fieldConfig.dimensions.width);
+    const height = parseFloat(fieldConfig.dimensions.height);
+
     mowerState.position = {
       x: parseFloat(mowerPosition.x.toFixed(2)),
       y: parseFloat(mowerPosition.y.toFixed(2))
+    };
+
+    // Simulate occasional position warning for testing
+    const simulateWarning = mowerState.mowingProgress % 20 === 0;
+    const errorAmount = simulateWarning ? 1.5 : 0.05;
+
+    mowerState.positionDebug = {
+      x_deadReckoning: parseFloat((mowerPosition.x + errorAmount * 0.3).toFixed(3)),
+      y_deadReckoning: parseFloat((mowerPosition.y + errorAmount * 0.3).toFixed(3)),
+      x_triangulated: parseFloat(mowerPosition.x.toFixed(3)),
+      y_triangulated: parseFloat(mowerPosition.y.toFixed(3)),
+      positionError: parseFloat(errorAmount.toFixed(3)),
+      positionWarning: errorAmount > 0.5,
+      triangulationValid: true
     };
   }
 
