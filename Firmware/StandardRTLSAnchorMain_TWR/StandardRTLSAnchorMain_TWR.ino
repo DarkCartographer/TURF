@@ -43,8 +43,8 @@ const uint8_t PIN_SS = 4; // spi select pin
 const char EUI[] = "AA:BB:CC:DD:EE:FF:00:01";
 
 Position position_self = {0,0};
-Position position_B = {0,1.0668};
-Position position_C = {3.048,1.0668};
+Position position_B = {0,3.0861};
+Position position_C = {3.0861,0};
 
 double range_self;
 double range_B;

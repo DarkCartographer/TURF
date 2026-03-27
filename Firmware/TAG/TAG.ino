@@ -15,8 +15,8 @@
 #include <math.h>
 
 #define SAMPLE_COUNT 10
-#define SSID "Your_SSID"
-#define PASSPHRASE "Your_Passphrase"
+#define SSID "tulsiwifi"
+#define PASSPHRASE "letsdance"
 
 //initial (home) position of robot
 #define START_X 0.4f
@@ -27,7 +27,7 @@
 #define RIGHT_IN1 21
 #define RIGHT_IN2 22
 
-#define LEFT_HALL_PIN 33
+#define LEFT_HALL_PIN 32
 #define RIGHT_HALL_PIN 25
 
 #define US_TRIG_PIN 26
@@ -37,7 +37,7 @@ static volatile bool obstacleStop = false;
 
 // Speed limits
 
-#define MAX_DUTY 50   // 50%
+#define MAX_DUTY 70   // 50%
 
 #define MAX_SPEED_MPS 0.8f
 #define UWB_GATE_MARGIN_M 0.25f
@@ -50,6 +50,7 @@ static volatile bool obstacleStop = false;
 #define RIGHT 3
 #define STOP 4
 
+static uint32_t lastNavUpdate = 0;
 
 #define WHEEL_BASE_M        0.219075f   // measure center-to-center wheel spacing
 #define METERS_PER_PULSE    0.0008372902f  // calibrate based on wheel/sensor
@@ -185,8 +186,7 @@ static SemaphoreHandle_t g_webMutex;
 
 
 waypoint nav_waypoints[] = {
-{0.4,0.4},{0.4,0.9},{0.4,1.4},{0.4,1.9},{0.4,2.4},
-{0.6668,2.4},{0.6668,1.9},{0.6668,1.4},{0.6668,0.9},{0.6668,0.4}
+{2,2}
 };
 
 int waypoint_index = 0;
@@ -409,6 +409,19 @@ void initPositionEstimator()
 
 void navigateToWaypoint(float x, float y, float heading)
 {
+
+    if(millis() - lastNavUpdate < 500) return;  // 10 Hz control loop
+
+    lastNavUpdate = millis();
+
+    WebSerial.print("Estimated position: ");
+    WebSerial.print(g_est.est_x, 3);
+    WebSerial.print(", ");
+    WebSerial.print(g_est.est_y, 3);
+    WebSerial.print("  heading: ");
+    WebSerial.println(g_est.est_heading, 3);
+
+
     waypoint wp = nav_waypoints[waypoint_index];
 
     float dist = distanceToWaypoint(x, y, wp);
@@ -435,18 +448,18 @@ void navigateToWaypoint(float x, float y, float heading)
 
     if(absError < 0.15)
     {
-        WebSerial.println("moving forward");
-        moveFunction(FORWARD, 100);
+        Serial.println("moving forward");
+        moveFunction(FORWARD, 225);
     }
     else if(error > 0)
     {
-        WebSerial.println("moving left");
-        moveFunction(LEFT, 50);
+        Serial.println("moving left");
+        moveFunction(LEFT, 225);
     }
     else
     {
-        WebSerial.println("moving right");
-        moveFunction(RIGHT, 50);
+        Serial.println("moving right");
+        moveFunction(RIGHT, 225);
     }
 }
 
@@ -556,7 +569,7 @@ float readUltrasonicDistance()
 
     if(duration == 0){
         
-        Serial.println("No echo detected");
+        //Serial.println("No echo detected");
         return -1;
     }
 
@@ -683,12 +696,7 @@ static void odometryTask(void *param)
             g_est.est_heading
         );
 
-        WebSerial.print("Estimated position: ");
-        WebSerial.print(g_est.est_x, 3);
-        WebSerial.print(", ");
-        WebSerial.print(g_est.est_y, 3);
-        WebSerial.print("  heading: ");
-        WebSerial.println(g_est.est_heading, 3);
+
 
         vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -703,9 +711,9 @@ static void ultrasonicTask(void *param)
 
         if(distance > 0 && distance <= 1.0)
         {
-            Serial.print("Obstacle distance: ");
-            Serial.print(distance);
-            Serial.println(" m");
+           // Serial.print("Obstacle distance: ");
+            //Serial.print(distance);
+            //Serial.println(" m");
         }
 
         if(distance > 0 && distance <= 0.5)
