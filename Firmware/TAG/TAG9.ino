@@ -37,9 +37,9 @@ static volatile bool obstacleStop = false;
 
 // Speed limits
 
-#define MAX_DUTY 70   // 50%
+#define MAX_DUTY 60   // 60%
 
-#define MAX_SPEED_MPS 0.8f
+#define MAX_SPEED_MPS 0.381f
 #define UWB_GATE_MARGIN_M 0.25f
 #define MIN_UWB_GATE_M 0.15f
 
@@ -241,7 +241,7 @@ static void initDw1000() {
     DW1000Ng::setEUI(EUI);
     DW1000Ng::setNetworkId(RTLS_APP_ID);
     DW1000Ng::setDeviceAddress(5);
-    DW1000Ng::setAntennaDelay(0);
+    DW1000Ng::setAntennaDelay(16436);
 
     DW1000Ng::applySleepConfiguration(SLEEP_CONFIG);
 
@@ -414,13 +414,6 @@ void navigateToWaypoint(float x, float y, float heading)
 
     lastNavUpdate = millis();
 
-    WebSerial.print("Estimated position: ");
-    WebSerial.print(g_est.est_x, 3);
-    WebSerial.print(", ");
-    WebSerial.print(g_est.est_y, 3);
-    WebSerial.print("  heading: ");
-    WebSerial.println(g_est.est_heading, 3);
-
 
     waypoint wp = nav_waypoints[waypoint_index];
 
@@ -429,6 +422,8 @@ void navigateToWaypoint(float x, float y, float heading)
     if(dist < 0.15)   // reached waypoint
     {
         waypoint_index++;
+        WebSerial.println("Reached a waypoint");
+        vTaskDelay(pdMS_TO_TICKS(1500));
 
         if(waypoint_index >= num_waypoints)
         {
@@ -616,18 +611,17 @@ static void uwbTask(void *param) {
         DW1000Ng::setEUI(EUI);
 
         // Do localization
-        RangeInfrastructureResult res = DW1000NgRTLS::tagTwrLocalize(1500);
+        RangeInfrastructureResult res = DW1000NgRTLS::tagTwrLocalize(4000);
 
         if (res.success) {
             // Update blink rate (with limits)
             uint32_t newRate = res.new_blink_rate;
-            if (newRate < 200)   newRate = 200;    // clamp
-            if (newRate > 2000) newRate = 2000;  // clamp
+            if (newRate < 1)   newRate = 1;    // clamp
+            if (newRate > 10000) newRate = 10000;  // clamp
             g_blinkRateMs = newRate;
         }
 
-        //WebSerial.println();
-        //WebSerial.print("Heartbeat");
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -648,6 +642,7 @@ static void PositionUpdateTask(void *param) {
             if(!acceptPositionMeasurement(p))
             {
                 // Ignore bad measurement
+                WebSerial.print("Ignoring Measurement");
                 continue;
             }
 
@@ -673,10 +668,17 @@ static void PositionUpdateTask(void *param) {
             correctEstimateWithUWB();
 
             
-            WebSerial.print("Robot position: ");
+            WebSerial.print("Robot UWB position: ");
             WebSerial.print(posBuffer[last].x, 3);
             WebSerial.print(", ");
             WebSerial.println(posBuffer[last].y, 3);
+
+            WebSerial.print("Estimated position: ");
+            WebSerial.print(g_est.est_x, 3);
+            WebSerial.print(", ");
+            WebSerial.print(g_est.est_y, 3);
+            WebSerial.print("  heading: ");
+            WebSerial.println(g_est.est_heading, 3);
         }
 
 

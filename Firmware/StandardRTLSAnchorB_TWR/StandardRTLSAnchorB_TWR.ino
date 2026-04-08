@@ -82,7 +82,7 @@ void setup() {
     DW1000Ng::setNetworkId(RTLS_APP_ID);
     DW1000Ng::setDeviceAddress(2);
 	
-    DW1000Ng::setAntennaDelay(33220);
+    DW1000Ng::setAntennaDelay(16657);
     
     Serial.println(F("Committed configuration ..."));
     // DEBUG chip info and registers pretty printed
@@ -115,10 +115,11 @@ void loop() {
             range_self = result.range;
             transmitRangeReport();
 
-            
+            /*
             String rangeString = "Range: "; rangeString += range_self; rangeString += " m";
             rangeString += "\t RX power: "; rangeString += DW1000Ng::getReceivePower(); rangeString += " dBm";
             Serial.println(rangeString);
+            */
             
         }
 }
