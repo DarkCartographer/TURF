@@ -50,6 +50,20 @@ static volatile bool obstacleStop = false;
 #define RIGHT 3
 #define STOP 4
 
+
+enum MotionPhase {
+    PHASE_MOVE = 0,
+    PHASE_STOP,
+    PHASE_MEASURE
+};
+
+static MotionPhase g_motionPhase = PHASE_STOP;
+static uint32_t g_phaseStartMs = 0;
+
+#define MOVE_TIME_MS     3000    // how long to drive
+#define STOP_TIME_MS     300    // let robot settle physically
+#define MEASURE_TIME_MS  10000    // collect UWB samples
+
 static uint32_t lastNavUpdate = 0;
 
 #define WHEEL_BASE_M        0.219075f   // measure center-to-center wheel spacing
@@ -410,7 +424,7 @@ void initPositionEstimator()
 void navigateToWaypoint(float x, float y, float heading)
 {
 
-    if(millis() - lastNavUpdate < 500) return;  // 10 Hz control loop
+    if(millis() - lastNavUpdate < 100) return;  // 10 Hz control loop
 
     lastNavUpdate = millis();
 
@@ -443,17 +457,17 @@ void navigateToWaypoint(float x, float y, float heading)
 
     if(absError < 0.15)
     {
-        Serial.println("moving forward");
+        //Serial.println("moving forward");
         moveFunction(FORWARD, 225);
     }
     else if(error > 0)
     {
-        Serial.println("moving left");
+        //Serial.println("moving left");
         moveFunction(LEFT, 225);
     }
     else
     {
-        Serial.println("moving right");
+        //Serial.println("moving right");
         moveFunction(RIGHT, 225);
     }
 }
@@ -523,7 +537,7 @@ void moveFunction(int action, int speed)
             g_leftWheelDir = WHEEL_STOP;
             g_rightWheelDir = WHEEL_STOP;
 
-            WebSerial.println("stopping");
+            //WebSerial.println("stopping");
             analogWrite(LEFT_IN1, 0);
             analogWrite(LEFT_IN2, 0);
             analogWrite(RIGHT_IN1, 0);
@@ -535,6 +549,12 @@ void moveFunction(int action, int speed)
 static bool acceptPositionMeasurement(const PositionPacket &p)
 {
     
+    bool isStationary = (g_motionPhase == PHASE_STOP || g_motionPhase == PHASE_MEASURE);
+    if (!isStationary)
+    {
+        return false;
+    }
+
     float dx = p.x - g_robot.x_m;
     float dy = p.y - g_robot.y_m;
 
@@ -690,15 +710,60 @@ static void odometryTask(void *param)
 
     for(;;)
     {
+
+        uint32_t now = millis();
+
         updateDeadReckoning();
 
-        navigateToWaypoint(
+        switch (g_motionPhase)
+        {
+          case PHASE_MOVE:
+          {
+            navigateToWaypoint(
             g_est.est_x,
             g_est.est_y,
             g_est.est_heading
-        );
+            );
+
+            if (now - g_phaseStartMs > MOVE_TIME_MS)
+            {
+                moveFunction(STOP, 0);
+                g_motionPhase = PHASE_STOP;
+                g_phaseStartMs = now;
+            }
+            break;
+          }
+        
 
 
+          case PHASE_STOP:
+          {
+              // motors off, let inertia die out
+              moveFunction(STOP, 0);
+
+              if (now - g_phaseStartMs > STOP_TIME_MS)
+              {
+                  g_motionPhase = PHASE_MEASURE;
+                  g_phaseStartMs = now;
+              }
+              break;
+          }
+
+          case PHASE_MEASURE:
+          {
+              // do NOT move
+              moveFunction(STOP, 0);
+
+              // here UWB + filtering runs normally
+
+              if (now - g_phaseStartMs > MEASURE_TIME_MS)
+              {
+                  g_motionPhase = PHASE_MOVE;
+                  g_phaseStartMs = now;
+              }
+              break;
+          }
+        }
 
         vTaskDelay(pdMS_TO_TICKS(20));
     }
