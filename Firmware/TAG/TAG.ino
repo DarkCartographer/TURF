@@ -423,14 +423,10 @@ void initPositionEstimator()
 
 void navigateToWaypoint(float x, float y, float heading)
 {
-
     if(millis() - lastNavUpdate < 100) return;  // 10 Hz control loop
-
     lastNavUpdate = millis();
 
-
     waypoint wp = nav_waypoints[waypoint_index];
-
     float dist = distanceToWaypoint(x, y, wp);
 
     if(dist < 0.15)   // reached waypoint
@@ -443,32 +439,40 @@ void navigateToWaypoint(float x, float y, float heading)
         {
             moveFunction(STOP, 0);
             WebSerial.println("all waypoints reached");
-            
             return;
         }
-
         return;
     }
 
     float desired = desiredHeading(x, y, wp);
     float error = wrapAngle(desired - heading);
-
     float absError = fabs(error);
 
-    if(absError < 0.15)
+    // If we are pointing roughly the right way, drive forward
+    if(absError < 0.15) 
     {
-        //Serial.println("moving forward");
-        moveFunction(FORWARD, 225);
+        moveFunction(FORWARD, 200); // Slightly reduced forward speed for stability
     }
-    else if(error > 0)
+    else 
     {
-        //Serial.println("moving left");
-        moveFunction(LEFT, 225);
-    }
-    else
-    {
-        //Serial.println("moving right");
-        moveFunction(RIGHT, 225);
+        // PROPORTIONAL CONTROL: Calculate turn speed based on how big the error is.
+        // kP is the "Proportional Gain". You will need to tune this number!
+        float kP = 80.0f; 
+        
+        // Base speed (minimum speed to overcome friction on grass) + the proportional error
+        int turnSpeed = 100 + (int)(absError * kP); 
+        
+        // Clamp the maximum speed so we don't exceed the PWM limit
+        if (turnSpeed > 225) turnSpeed = 225; 
+
+        if(error > 0)
+        {
+            moveFunction(LEFT, turnSpeed);
+        }
+        else
+        {
+            moveFunction(RIGHT, turnSpeed);
+        }
     }
 }
 
@@ -654,14 +658,10 @@ static void PositionUpdateTask(void *param) {
 
     PositionPacket p;
     for (;;) {
-        // Block indefinitely waiting for data 
         if (xQueueReceive(g_posQueue, &p, portMAX_DELAY) == pdTRUE) {
             
-
-            // Reject impossible motion
             if(!acceptPositionMeasurement(p))
             {
-                // Ignore bad measurement
                 WebSerial.print("Ignoring Measurement");
                 continue;
             }
@@ -669,7 +669,6 @@ static void PositionUpdateTask(void *param) {
             g_robot.x_m = p.x;
             g_robot.y_m = p.y;
             g_robot.last_uwb_ms = p.t_ms;
-
 
             xSemaphoreTake(g_posMutex, portMAX_DELAY);
 
@@ -687,7 +686,16 @@ static void PositionUpdateTask(void *param) {
 
             correctEstimateWithUWB();
 
-            
+            float uwbHeading, uwbSpeed;
+            if(computeHeadingLS(posBuffer, g_posCount, uwbHeading, uwbSpeed)) 
+            {
+                if (uwbSpeed > 0.1f) 
+                {
+                    float headingError = wrapAngle(uwbHeading - g_est.est_heading);
+                    g_est.est_heading = wrapAngle(g_est.est_heading + (0.2f * headingError));
+                }
+            }
+
             WebSerial.print("Robot UWB position: ");
             WebSerial.print(posBuffer[last].x, 3);
             WebSerial.print(", ");
@@ -700,8 +708,6 @@ static void PositionUpdateTask(void *param) {
             WebSerial.print("  heading: ");
             WebSerial.println(g_est.est_heading, 3);
         }
-
-
     }
 }
 
