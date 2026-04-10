@@ -18,7 +18,6 @@
 #define SSID "tulsiwifi"
 #define PASSPHRASE "letsdance"
 
-//initial (home) position of robot
 #define START_X 0.4f
 #define START_Y 0.4f
 
@@ -35,21 +34,17 @@
 
 static volatile bool obstacleStop = false;
 
-// Speed limits
-
-#define MAX_DUTY 60   // 60%
+#define MAX_DUTY 60   
 
 #define MAX_SPEED_MPS 0.381f
 #define UWB_GATE_MARGIN_M 0.25f
 #define MIN_UWB_GATE_M 0.15f
 
-// Motion commands
 #define FORWARD 0
 #define BACKWARD 1
 #define LEFT 2
 #define RIGHT 3
 #define STOP 4
-
 
 enum MotionPhase {
     PHASE_MOVE = 0,
@@ -60,17 +55,16 @@ enum MotionPhase {
 static MotionPhase g_motionPhase = PHASE_STOP;
 static uint32_t g_phaseStartMs = 0;
 
-#define MOVE_TIME_MS     3000    // how long to drive
-#define STOP_TIME_MS     300    // let robot settle physically
-#define MEASURE_TIME_MS  10000    // collect UWB samples
+#define MOVE_TIME_MS     3000    
+#define STOP_TIME_MS     300    
+#define MEASURE_TIME_MS  10000    
 
 static uint32_t lastNavUpdate = 0;
 
-#define WHEEL_BASE_M        0.219075f   // measure center-to-center wheel spacing
-#define METERS_PER_PULSE    0.0008372902f  // calibrate based on wheel/sensor
-#define UWB_CORRECTION_GAIN 0.35f   // 0..1, higher = trust UWB more
+#define WHEEL_BASE_M        0.219075f   
+#define METERS_PER_PULSE    0.0008372902f  
+#define UWB_CORRECTION_GAIN 0.35f   
 
-// Hall timing variables
 volatile unsigned long lastLeftPulse = 0;
 volatile unsigned long lastRightPulse = 0;
 volatile unsigned long leftPeriod = 0;
@@ -78,14 +72,11 @@ volatile unsigned long rightPeriod = 0;
 volatile unsigned long g_leftPulseCount = 0;
 volatile unsigned long g_rightPulseCount = 0;
 
-
 static constexpr uint8_t PIN_RST = 27;
 static constexpr uint8_t PIN_SS  = 4;
 
-// 64-bit EUI (DW1000)
 static const char EUI[] = "AA:BB:CC:DD:EE:FF:00:00";
 
-// -------------------- Configs --------------------
 device_configuration_t DEFAULT_CONFIG = {
     false,
     true,
@@ -112,16 +103,15 @@ static frame_filtering_configuration_t TAG_FRAME_FILTER_CONFIG = {
 };
 
 static sleep_configuration_t SLEEP_CONFIG = {
-    false,  // onWakeUpRunADC
-    false,  // onWakeUpReceive
-    false,  // onWakeUpLoadEUI
-    true,   // onWakeUpLoadL64Param
-    true,   // preserveSleep
-    true,   // enableSLP
-    false,  // enableWakePIN
-    true    // enableWakeSPI
+    false,  
+    false,  
+    false,  
+    true,   
+    true,   
+    true,   
+    false,  
+    true    
 };
-
 
 typedef struct {
     float x;
@@ -141,8 +131,6 @@ typedef struct {
   float y;
 } waypoint;
 
-
-
 typedef struct {
     float x_m;
     float y_m;
@@ -150,7 +138,6 @@ typedef struct {
 } RobotPose;
 
 static RobotPose g_robot;
-
 
 enum WheelDir {
     WHEEL_REV = -1,
@@ -160,7 +147,6 @@ enum WheelDir {
 
 static volatile int8_t g_leftWheelDir = WHEEL_STOP;
 static volatile int8_t g_rightWheelDir = WHEEL_STOP;
-
 
 typedef struct {
     float uwb_x;
@@ -176,8 +162,6 @@ typedef struct {
 } PositionEstimator;
 
 static PositionEstimator g_est;
-
-// ---------------- Hall Interrupts ----------------
 
 void IRAM_ATTR leftHallISR() {
     unsigned long now = micros();
@@ -198,7 +182,6 @@ AsyncWebServer server(80);
 static String g_webOutput;
 static SemaphoreHandle_t g_webMutex;
 
-
 waypoint nav_waypoints[] = {
 {2,2}
 };
@@ -206,23 +189,18 @@ waypoint nav_waypoints[] = {
 int waypoint_index = 0;
 int num_waypoints = sizeof(nav_waypoints) / sizeof(nav_waypoints[0]);
 
-
-
 PositionSample posBuffer[SAMPLE_COUNT];
-static int g_posHead = 0;   // next write index
-static int g_posCount = 0;  // number of valid samples
+static int g_posHead = 0;   
+static int g_posCount = 0;  
 
 static SemaphoreHandle_t g_posMutex;
 
 static volatile uint32_t g_blinkRateMs = 200;
 
-// Queue for incoming position packets from ESP-NOW callback
 static QueueHandle_t g_posQueue = nullptr;
 
-// Task handles
 static TaskHandle_t g_uwbTaskHandle   = nullptr;
 static TaskHandle_t g_printTaskHandle = nullptr;
-
 
 static void initDw1000();
 static void initEspNow();
@@ -231,15 +209,12 @@ static void printDw1000Info();
 static void uwbTask(void *param);
 static void printTask(void *param);
 
-
 static void HeadingTask(void *param);
 bool computeHeadingLS(const PositionSample *samples, int n, float &heading, float &speed);
 void moveFunction(int action, int speed);
 
-// ESP-NOW callback
 static void onReceive(const esp_now_recv_info *info, const uint8_t *incomingData, int len);
 
-// -------------------- Init Helpers --------------------
 static void initDw1000() {
 #if defined(ESP8266)
     DW1000Ng::initializeNoInterrupt(PIN_SS);
@@ -284,7 +259,6 @@ static void initEspNow() {
 
     if (esp_now_init() != ESP_OK) {
         Serial.println("ERROR: ESP-NOW init failed");
-        // probably add code to retry
         while (true) { delay(1000); }
     }
 
@@ -318,7 +292,6 @@ float desiredHeading(float x, float y, waypoint wp)
     return atan2(dy, dx);
 }
 
-
 bool computeWeightedPosition(float &x_out, float &y_out)
 {
     xSemaphoreTake(g_posMutex, portMAX_DELAY);
@@ -337,7 +310,7 @@ bool computeWeightedPosition(float &x_out, float &y_out)
     {
         int idx = (g_posHead - 1 - k + SAMPLE_COUNT) % SAMPLE_COUNT;
 
-        float w = float(g_posCount - k);   // newest gets biggest weight
+        float w = float(g_posCount - k);   
 
         sumW += w;
         sumX += posBuffer[idx].x * w;
@@ -356,51 +329,45 @@ void updateDeadReckoning()
     uint32_t leftCount, rightCount;
     int8_t leftDir, rightDir;
 
-    noInterrupts();                     //avoid ISR updating the pulse counts
-    leftCount = g_leftPulseCount;       //total number of pulses from wheel encoders since boot
+    noInterrupts();                     
+    leftCount = g_leftPulseCount;       
     rightCount = g_rightPulseCount;
-    leftDir = g_leftWheelDir;           //is the wheel spinning forward or backward
+    leftDir = g_leftWheelDir;           
     rightDir = g_rightWheelDir;
-    interrupts();                       //re enable interrupts
+    interrupts();                       
 
-
-    int32_t dLeft = (int32_t)leftCount - (int32_t)g_est.last_left_count;            //how many pulses since last run
+    int32_t dLeft = (int32_t)leftCount - (int32_t)g_est.last_left_count;             
     int32_t dRight = (int32_t)rightCount - (int32_t)g_est.last_right_count;
 
-    g_est.last_left_count = leftCount;                                          //update counts
+    g_est.last_left_count = leftCount;                                              
     g_est.last_right_count = rightCount;
 
-    if(dLeft == 0 && dRight == 0)                   //ignore if the wheels have not moved since last run
+    if(dLeft == 0 && dRight == 0)                   
         return;
 
-    float sLeft = float(dLeft) * METERS_PER_PULSE * float(leftDir);         //left wheel travel
-    float sRight = float(dRight) * METERS_PER_PULSE * float(rightDir);      //right wheel travel
+    float sLeft = float(dLeft) * METERS_PER_PULSE * float(leftDir);         
+    float sRight = float(dRight) * METERS_PER_PULSE * float(rightDir);      
 
-    
+    float dCenter = 0.5f * (sLeft + sRight);            
+    float dTheta = (sRight - sLeft) / WHEEL_BASE_M;     
 
-    float dCenter = 0.5f * (sLeft + sRight);            //assume the center has travelled the average of the two wheel's travel
-    float dTheta = (sRight - sLeft) / WHEEL_BASE_M;     //apply differential drive thetha calculation
+    float thetaMid = g_est.est_heading + 0.5f * dTheta; 
 
-    float thetaMid = g_est.est_heading + 0.5f * dTheta; //assume the robot travelled with heading halfway between the last heading and new heading
-
-    g_est.est_x += dCenter * cosf(thetaMid);        //get x component
-    g_est.est_y += dCenter * sinf(thetaMid);        //get y component
-    g_est.est_heading = wrapAngle(g_est.est_heading + dTheta);      //ensure angles stay between -pi and pi
+    g_est.est_x += dCenter * cosf(thetaMid);        
+    g_est.est_y += dCenter * sinf(thetaMid);        
+    g_est.est_heading = wrapAngle(g_est.est_heading + dTheta);      
 }
 
 void correctEstimateWithUWB()
 {
     float uwbX, uwbY;
 
-    //compute a weighted average of the last few UWB positions so that 
-    //the most recent measurement has the most influence on result
     if(!computeWeightedPosition(uwbX, uwbY))
         return;
 
     g_est.uwb_x = uwbX;
     g_est.uwb_y = uwbY;
 
-    //update the estimated positions. Gain controls how much of an effect the uwb value has
     g_est.est_x = (1.0f - UWB_CORRECTION_GAIN) * g_est.est_x + UWB_CORRECTION_GAIN * uwbX;
     g_est.est_y = (1.0f - UWB_CORRECTION_GAIN) * g_est.est_y + UWB_CORRECTION_GAIN * uwbY;
 }
@@ -423,13 +390,13 @@ void initPositionEstimator()
 
 void navigateToWaypoint(float x, float y, float heading)
 {
-    if(millis() - lastNavUpdate < 100) return;  // 10 Hz control loop
+    if(millis() - lastNavUpdate < 100) return;  
     lastNavUpdate = millis();
 
     waypoint wp = nav_waypoints[waypoint_index];
     float dist = distanceToWaypoint(x, y, wp);
 
-    if(dist < 0.15)   // reached waypoint
+    if(dist < 0.15)   
     {
         waypoint_index++;
         WebSerial.println("Reached a waypoint");
@@ -448,21 +415,15 @@ void navigateToWaypoint(float x, float y, float heading)
     float error = wrapAngle(desired - heading);
     float absError = fabs(error);
 
-    // If we are pointing roughly the right way, drive forward
-    if(absError < 0.15) 
+    if(absError < 0.15)
     {
-        moveFunction(FORWARD, 200); // Slightly reduced forward speed for stability
+        moveFunction(FORWARD, 200); 
     }
-    else 
+    else
     {
-        // PROPORTIONAL CONTROL: Calculate turn speed based on how big the error is.
-        // kP is the "Proportional Gain". You will need to tune this number!
         float kP = 80.0f; 
-        
-        // Base speed (minimum speed to overcome friction on grass) + the proportional error
         int turnSpeed = 100 + (int)(absError * kP); 
         
-        // Clamp the maximum speed so we don't exceed the PWM limit
         if (turnSpeed > 225) turnSpeed = 225; 
 
         if(error > 0)
@@ -478,17 +439,14 @@ void navigateToWaypoint(float x, float y, float heading)
 
 void moveFunction(int action, int speed)
 {
-
     if(obstacleStop && action != STOP)
         return;
-
 
     int pwm = (speed * MAX_DUTY) / 100;
 
     switch (action)
     {
         case FORWARD:
-
             g_leftWheelDir = WHEEL_FWD;
             g_rightWheelDir = WHEEL_FWD;
 
@@ -500,7 +458,6 @@ void moveFunction(int action, int speed)
         break;
 
         case BACKWARD:
-
             g_leftWheelDir = WHEEL_REV;
             g_rightWheelDir = WHEEL_REV;
 
@@ -512,7 +469,6 @@ void moveFunction(int action, int speed)
         break;
 
         case LEFT:
-
             g_leftWheelDir = WHEEL_REV;
             g_rightWheelDir = WHEEL_FWD;
 
@@ -524,7 +480,6 @@ void moveFunction(int action, int speed)
         break;
 
         case RIGHT:
-
             g_leftWheelDir = WHEEL_FWD;
             g_rightWheelDir = WHEEL_REV;
 
@@ -537,11 +492,9 @@ void moveFunction(int action, int speed)
 
         case STOP:
         default:
-
             g_leftWheelDir = WHEEL_STOP;
             g_rightWheelDir = WHEEL_STOP;
 
-            //WebSerial.println("stopping");
             analogWrite(LEFT_IN1, 0);
             analogWrite(LEFT_IN2, 0);
             analogWrite(RIGHT_IN1, 0);
@@ -552,7 +505,6 @@ void moveFunction(int action, int speed)
 
 static bool acceptPositionMeasurement(const PositionPacket &p)
 {
-    
     bool isStationary = (g_motionPhase == PHASE_STOP || g_motionPhase == PHASE_MEASURE);
     if (!isStationary)
     {
@@ -584,17 +536,15 @@ float readUltrasonicDistance()
     delayMicroseconds(10);
     digitalWrite(US_TRIG_PIN, LOW);
 
-    long duration = pulseIn(US_ECHO_PIN, HIGH, 30000); // timeout 30ms
+    long duration = pulseIn(US_ECHO_PIN, HIGH, 30000); 
 
     if(duration == 0){
-        
-        //Serial.println("No echo detected");
         return -1;
     }
 
-    float distance = duration * 0.0343 / 2.0; // cm
+    float distance = duration * 0.0343 / 2.0; 
 
-    return (distance / 100.0); // convert to meters
+    return (distance / 100.0); 
 }
 
 void prefillPositionBuffer()
@@ -616,32 +566,24 @@ void prefillPositionBuffer()
     g_posCount = SAMPLE_COUNT;
 }
 
-// -------------------- Tasks --------------------
-
-
 static void uwbTask(void *param) {
     (void)param;
 
     for (;;) {
-        // Put DW1000 in its own deep sleep mode between blinks
         DW1000Ng::deepSleep();
 
-        // Sleep this task for blink rate
-        uint32_t localBlinkMs = g_blinkRateMs; // single read of volatile
+        uint32_t localBlinkMs = g_blinkRateMs; 
         vTaskDelay(pdMS_TO_TICKS(localBlinkMs));
-
 
         DW1000Ng::spiWakeup();
         DW1000Ng::setEUI(EUI);
 
-        // Do localization
         RangeInfrastructureResult res = DW1000NgRTLS::tagTwrLocalize(4000);
 
         if (res.success) {
-            // Update blink rate (with limits)
             uint32_t newRate = res.new_blink_rate;
-            if (newRate < 1)   newRate = 1;    // clamp
-            if (newRate > 10000) newRate = 10000;  // clamp
+            if (newRate < 1)   newRate = 1;    
+            if (newRate > 10000) newRate = 10000;  
             g_blinkRateMs = newRate;
         }
 
@@ -649,7 +591,6 @@ static void uwbTask(void *param) {
     }
 }
 
-// Consumes position packets that come in via ESP-NOW callback
 static void PositionUpdateTask(void *param) {
     (void)param;
     
@@ -713,10 +654,8 @@ static void PositionUpdateTask(void *param) {
 
 static void odometryTask(void *param)
 {
-
     for(;;)
     {
-
         uint32_t now = millis();
 
         updateDeadReckoning();
@@ -739,12 +678,9 @@ static void odometryTask(void *param)
             }
             break;
           }
-        
-
-
+          
           case PHASE_STOP:
           {
-              // motors off, let inertia die out
               moveFunction(STOP, 0);
 
               if (now - g_phaseStartMs > STOP_TIME_MS)
@@ -757,10 +693,7 @@ static void odometryTask(void *param)
 
           case PHASE_MEASURE:
           {
-              // do NOT move
               moveFunction(STOP, 0);
-
-              // here UWB + filtering runs normally
 
               if (now - g_phaseStartMs > MEASURE_TIME_MS)
               {
@@ -779,20 +712,16 @@ static void ultrasonicTask(void *param)
 {
     while(true)
     {
-        //Serial.print("checking distance ");
         float distance = readUltrasonicDistance();
 
         if(distance > 0 && distance <= 1.0)
         {
-           // Serial.print("Obstacle distance: ");
-            //Serial.print(distance);
-            //Serial.println(" m");
+            // Optional debugging logic here
         }
 
         if(distance > 0 && distance <= 0.5)
         {
             obstacleStop = true;
-
             moveFunction(STOP, 0);
         }
         else
@@ -803,10 +732,6 @@ static void ultrasonicTask(void *param)
         vTaskDelay(pdMS_TO_TICKS(80));
     }
 }
-
-
-
-// -------------------- ESP-NOW Callback --------------------
 
 static void onReceive(const esp_now_recv_info *info, const uint8_t *incomingData, int len) {
     (void)info;
@@ -824,7 +749,6 @@ static void onReceive(const esp_now_recv_info *info, const uint8_t *incomingData
         portYIELD_FROM_ISR();
     }
 }
-
 
 bool computeHeadingLS(const PositionSample *samples, int n, float &heading, float &speed)
 {
@@ -868,20 +792,11 @@ bool computeHeadingLS(const PositionSample *samples, int n, float &heading, floa
 
     speed = hypot(vx, vy);
 
-    /*
-    if (speed < 0.05) // robot barely moving
-        return false;
-    */
-
     heading = atan2(vy, vx);
 
     return true;
 }
 
-
-
-
-// -------------------- Setup --------------------
 void setup() {
     Serial.begin(115200);
 
@@ -907,10 +822,9 @@ void setup() {
     g_posMutex = xSemaphoreCreateMutex();
     g_webMutex = xSemaphoreCreateMutex();
 
-    // Create queue BEFORE registering callback (so callback has somewhere to send)
     g_posQueue = xQueueCreate(
-        10,                    // depth
-        sizeof(PositionPacket) // item size
+        10,                    
+        sizeof(PositionPacket) 
     );
     if (!g_posQueue) {
         Serial.println("ERROR: Failed to create position queue");
@@ -948,8 +862,6 @@ void setup() {
     WebSerial.begin(&server);
     server.begin();
 
-    // Create tasks
-
     xTaskCreatePinnedToCore(
         uwbTask,
         "UWBTask",
@@ -960,7 +872,6 @@ void setup() {
         1                  
     );
 
-
     xTaskCreatePinnedToCore(
         PositionUpdateTask,
         "PositionUpdateTask",
@@ -970,7 +881,6 @@ void setup() {
         nullptr,
         1
     );
-
 
     xTaskCreatePinnedToCore(
         ultrasonicTask,
@@ -992,11 +902,9 @@ void setup() {
         1
     );
     
-
     Serial.println("Setup complete.");
 }
 
 void loop() {
     // Nothing here. FreeRTOS tasks run the program.
-
 }
