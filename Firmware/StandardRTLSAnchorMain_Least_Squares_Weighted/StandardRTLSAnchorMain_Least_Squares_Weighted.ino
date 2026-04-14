@@ -17,7 +17,22 @@
 #include <DW1000NgRanging.hpp>
 #include <DW1000NgRTLS.hpp>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <WiFi.h>
+
+// === UWB distance correction functions ===
+
+float correctAnchorA(float m) {
+    return -0.0613539660f * m * m + 0.9854327824f * m + 0.2231270241f;
+}
+
+float correctAnchorB(float m) {
+    return -0.0568271523f * m * m + 0.9687394152f * m + 0.1995927684f;
+}
+
+float correctAnchorC(float m) {
+    return -0.0729287388f * m * m + 1.0907117325f * m + 0.0702370832f;
+}
 
 typedef struct Position {
     double x;
@@ -88,9 +103,22 @@ frame_filtering_configuration_t ANCHOR_FRAME_FILTER_CONFIG = {
     true /* This allows blink frames */
 };
 
+constexpr char WIFI_SSID[] = "tulsiwifi";
+
+int32_t getWiFiChannel(const char *ssid) {
+  if (int32_t n = WiFi.scanNetworks()) {
+      for (uint8_t i=0; i<n; i++) {
+          if (!strcmp(ssid, WiFi.SSID(i).c_str())) {
+              return WiFi.channel(i);
+          }
+      }
+  }
+  return 0;
+}
+
 void setup() {
     // DEBUG monitoring
-    Serial.begin(115200);
+    Serial.begin(250000);
     Serial.println(F("### DW1000Ng-arduino-ranging-anchorMain ###"));
     pinMode(PIN_SS, OUTPUT);
     digitalWrite(PIN_SS, HIGH);
@@ -117,7 +145,7 @@ void setup() {
     DW1000Ng::setNetworkId(RTLS_APP_ID);
     DW1000Ng::setDeviceAddress(1);
 	
-    DW1000Ng::setAntennaDelay(16540);
+    DW1000Ng::setAntennaDelay(16508);
     
     Serial.println(F("Committed configuration ..."));
     // DEBUG chip info and registers pretty printed
@@ -132,38 +160,153 @@ void setup() {
     Serial.print("Device mode: "); Serial.println(msg);
 
     WiFi.mode(WIFI_STA);
+    int32_t channel = getWiFiChannel(WIFI_SSID);
 
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+    
+    Serial.println("ESP-NOW initializing");
     if (esp_now_init() != ESP_OK) {
         Serial.println("ESP-NOW init failed");
     }
+    Serial.println("ESP-NOW init succeeded");
 
     esp_now_peer_info_t peer{};
     memcpy(peer.peer_addr, robotMAC, 6);
-    peer.channel = 0;
     peer.encrypt = false;
 
     esp_now_add_peer(&peer);
+    Serial.println("Fully Initialized");
 
 }
 
 
 
 
-/* using https://math.stackexchange.com/questions/884807/find-x-location-using-3-known-x-y-location-using-trilateration */
-void calculatePosition(double &x, double &y) {
+bool calculatePosition(double &x, double &y) {
+    // Use corrected copies, do not overwrite the globals
+    const double rA = correctAnchorA(range_self);
+    const double rB = correctAnchorB(range_B);
+    const double rC = correctAnchorC(range_C);
 
-    /* This gives for granted that the z plane is the same for anchor and tags */
-    double A = ( (-2*position_self.x) + (2*position_B.x) );
-    double B = ( (-2*position_self.y) + (2*position_B.y) );
-    double C = (range_self*range_self) - (range_B*range_B) - (position_self.x*position_self.x) + (position_B.x*position_B.x) - (position_self.y*position_self.y) + (position_B.y*position_B.y);
-    double D = ( (-2*position_B.x) + (2*position_C.x) );
-    double E = ( (-2*position_B.y) + (2*position_C.y) );
-    double F = (range_B*range_B) - (range_C*range_C) - (position_B.x*position_B.x) + (position_C.x*position_C.x) - (position_B.y*position_B.y) + (position_C.y*position_C.y);
+    /*
+    Serial.print("Distance from A: ");
+    Serial.println(rA);
 
-    x = (C*E-F*B) / (E*A-B*D);
-    y = (C*D-A*F) / (B*D-A*E);
+    Serial.print("Distance from B: ");
+    Serial.println(rB);
+
+    Serial.print("Distance from C: ");
+    Serial.println(rC);
+
+    */
+
+    if (rA <= 0.0 || rB <= 0.0 || rC <= 0.0) {
+        return false;
+    }
+
+    // Anchor coordinates
+    const double x1 = position_self.x;
+    const double y1 = position_self.y;
+    const double x2 = position_B.x;
+    const double y2 = position_B.y;
+    const double x3 = position_C.x;
+    const double y3 = position_C.y;
+
+    // Initial guess from exact algebraic solve
+    {
+        const double A = (-2.0 * x1) + (2.0 * x2);
+        const double B = (-2.0 * y1) + (2.0 * y2);
+        const double C = (rA * rA) - (rB * rB)
+                       - (x1 * x1) + (x2 * x2)
+                       - (y1 * y1) + (y2 * y2);
+
+        const double D = (-2.0 * x2) + (2.0 * x3);
+        const double E = (-2.0 * y2) + (2.0 * y3);
+        const double F = (rB * rB) - (rC * rC)
+                       - (x2 * x2) + (x3 * x3)
+                       - (y2 * y2) + (y3 * y3);
+
+        const double det1 = (E * A - B * D);
+        const double det2 = (B * D - A * E);
+
+        if (fabs(det1) < 1e-9 || fabs(det2) < 1e-9) {
+            return false;
+        }
+
+        x = (C * E - F * B) / det1;
+        y = (C * D - A * F) / det2;
+    }
+
+    // Inverse-distance weights based on corrected measured ranges
+    const double wA = 1.0 / fmax(rA*rA, 0.05);
+    const double wB = 1.0 / fmax(rB*rB, 0.05);
+    const double wC = 1.0 / fmax(rC*rC, 0.05);
+
+    // Gauss-Newton weighted least-squares refinement
+    for (int iter = 0; iter < 6; ++iter) {
+        const double dx1 = x - x1;
+        const double dy1 = y - y1;
+        const double dx2 = x - x2;
+        const double dy2 = y - y2;
+        const double dx3 = x - x3;
+        const double dy3 = y - y3;
+
+        const double d1 = sqrt(dx1 * dx1 + dy1 * dy1);
+        const double d2 = sqrt(dx2 * dx2 + dy2 * dy2);
+        const double d3 = sqrt(dx3 * dx3 + dy3 * dy3);
+
+        if (d1 < 1e-6 || d2 < 1e-6 || d3 < 1e-6) {
+            return false;
+        }
+
+        // Residuals: predicted distance - measured distance
+        const double f1 = d1 - rA;
+        const double f2 = d2 - rB;
+        const double f3 = d3 - rC;
+
+        // Jacobian rows
+        const double j11 = dx1 / d1;
+        const double j12 = dy1 / d1;
+        const double j21 = dx2 / d2;
+        const double j22 = dy2 / d2;
+        const double j31 = dx3 / d3;
+        const double j32 = dy3 / d3;
+
+        // J^T W J
+        double H00 = wA * j11 * j11 + wB * j21 * j21 + wC * j31 * j31;
+        double H01 = wA * j11 * j12 + wB * j21 * j22 + wC * j31 * j32;
+        double H11 = wA * j12 * j12 + wB * j22 * j22 + wC * j32 * j32;
+
+        // Light damping for stability
+        H00 += 1e-6;
+        H11 += 1e-6;
+
+        // J^T W f
+        const double g0 = wA * j11 * f1 + wB * j21 * f2 + wC * j31 * f3;
+        const double g1 = wA * j12 * f1 + wB * j22 * f2 + wC * j32 * f3;
+
+        const double det = H00 * H11 - H01 * H01;
+        if (fabs(det) < 1e-12) {
+            return false;
+        }
+
+        // Solve (J^T W J) * step = -J^T W f
+        const double stepX = -( H11 * g0 - H01 * g1) / det;
+        const double stepY = -(-H01 * g0 + H00 * g1) / det;
+
+        x += stepX;
+        y += stepY;
+
+        // Converged
+        if ((stepX * stepX + stepY * stepY) < 1e-8) {
+            break;
+        }
+    }
+
+    return true;
 }
-
 
 
 void loop() {
@@ -183,27 +326,35 @@ void loop() {
             if(result.range != 0){
             range_self = result.range;
             }
-
+            
+            /*
             String rangeString = "Range: "; rangeString += range_self; rangeString += " m";
             rangeString += "\t RX power: "; rangeString += DW1000Ng::getReceivePower(); rangeString += " dBm";
             Serial.println(rangeString);
+            */
 
         } else if(recv_data[9] == 0x60) {
             double range = static_cast<double>(DW1000NgUtils::bytesAsValue(&recv_data[10],2) / 1000.0);
+
+            /*
             String rangeReportString = "Range from: "; rangeReportString += recv_data[7];
             rangeReportString += " = "; rangeReportString += range;
             Serial.println(rangeReportString);
+            */
             if(received_B == false && recv_data[7] == anchor_b[0] && recv_data[8] == anchor_b[1]) {
                 range_B = range;
                 received_B = true;
             } else if(received_B == true && recv_data[7] == anchor_c[0] && recv_data[8] == anchor_c[1]){
                 range_C = range;
-                double x,y;
-                calculatePosition(x,y);
+                double x, y;
+                if (!calculatePosition(x, y)) {
+                    received_B = false;
+                    return;
+                }
+
                 PositionPacket p;
                 p.x = x;
                 p.y = y;
-                p.t_ms = millis();
                 
                 
 

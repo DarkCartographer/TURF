@@ -82,7 +82,7 @@ void setup() {
     DW1000Ng::setNetworkId(RTLS_APP_ID);
     DW1000Ng::setDeviceAddress(2);
 	
-    DW1000Ng::setAntennaDelay(16657);
+    DW1000Ng::setAntennaDelay(16511);
     
     Serial.println(F("Committed configuration ..."));
     // DEBUG chip info and registers pretty printed
@@ -111,7 +111,7 @@ void transmitRangeReport() {
 void loop() {     
         RangeAcceptResult result = DW1000NgRTLS::anchorRangeAccept(NextActivity::RANGING_CONFIRM, next_anchor);
         if(result.success) {
-            delay(10); // Tweak based on your hardware
+            delay(2); // Tweak based on your hardware
             range_self = result.range;
             transmitRangeReport();
 

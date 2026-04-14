@@ -27,7 +27,7 @@ const char EUI[] = "AA:BB:CC:DD:EE:FF:00:03";
 
 byte main_anchor_address[] = {0x01, 0x00};
 
-uint16_t blink_rate = 200;
+uint16_t blink_rate = 10;
 
 double range_self;
 
@@ -82,7 +82,7 @@ void setup() {
     DW1000Ng::setNetworkId(RTLS_APP_ID);
     DW1000Ng::setDeviceAddress(3);
 	
-    DW1000Ng::setAntennaDelay(16484);
+    DW1000Ng::setAntennaDelay(16506);
     
     Serial.println(F("Committed configuration ..."));
     // DEBUG chip info and registers pretty printed
@@ -110,7 +110,7 @@ void transmitRangeReport() {
 void loop() {
      RangeAcceptResult result = DW1000NgRTLS::anchorRangeAccept(NextActivity::ACTIVITY_FINISHED, blink_rate);
      if(result.success) {
-        delay(10); // Tweak based on your hardware
+        delay(2); // Tweak based on your hardware
         range_self = result.range;
         transmitRangeReport();
 
