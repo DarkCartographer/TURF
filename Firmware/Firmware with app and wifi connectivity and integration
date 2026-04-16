@@ -14,7 +14,7 @@
 #include <esp_now.h>
 #include <math.h>
 
-#include <ArduinoJson.h>
+#include <ArduinoJson.h> // JavaScript Object Notation (JSON) for data formatting
 
 // --- Mower State Variables ---
 bool g_isMowing = false;       
@@ -65,15 +65,16 @@ enum MowerState {
     STATE_DRIVING,
     STATE_SETTLING,
     STATE_CORRECTING,
-    STATE_CALIBRATING // Added for safe execution of the calibration spin
+    STATE_CALIBRATING // Safe execution of the calibration spin
 };
 
 static MowerState g_state = STATE_IDLE;
 static uint32_t g_stateTimer = 0;
-
 static uint32_t lastNavUpdate = 0;
 
-#define WHEEL_BASE_M        0.219075f   
+// Dynamic Wheelbase - Can be overwritten by the mobile application
+float g_wheelBase = 0.219075f;   
+
 #define METERS_PER_PULSE    0.0008372902f  
 #define UWB_CORRECTION_GAIN 1.0f   // Set to 1.0 so the Ultra-Wideband (UWB) fully overrides dead reckoning
 
@@ -143,7 +144,7 @@ typedef struct {
 static PositionEstimator g_est;
 
 // --- Interrupt Service Routines (ISR) ---
-// These pause the main code immediately when the hardware detects a wheel click
+// These functions pause the main code immediately when the hardware detects a wheel click
 void IRAM_ATTR leftHallISR() {
     unsigned long now = micros();
     leftPeriod = now - lastLeftPulse;
@@ -161,7 +162,7 @@ void IRAM_ATTR rightHallISR() {
 AsyncWebServer server(80);
 
 // --- Path Generation ---
-#define MAX_WAYPOINTS 400 // Increased to accommodate the new midpoints
+#define MAX_WAYPOINTS 400 // Capacity to accommodate halfway UWB checkpoints
 waypoint nav_waypoints[MAX_WAYPOINTS];
 int waypoint_index = 0;
 int num_waypoints = 0;
@@ -180,6 +181,7 @@ void moveFunction(int action, int speed);
 static void onReceive(const uint8_t *mac_addr, const uint8_t *incomingData, int len);
 bool computeWeightedPosition(float &x_out, float &y_out);
 
+// Generates a boustrophedon (snake-like) coverage path for RoboMow
 void generateMowingPath(float width, float height) {
     float cut_width = 0.3f; 
     float margin = 0.2f;    
@@ -187,37 +189,34 @@ void generateMowingPath(float width, float height) {
     waypoint_index = 0;
     bool moving_up = true;
     
-    // Calculate the exact center of the Y-axis
+    // Calculate the exact center of the Y-axis for midpoint UWB checks
     float mid_y = height / 2.0f; 
     
     for (float x = margin; x <= (width - margin); x += cut_width) {
-        // Prevent memory overflow (we now add 3 waypoints per column instead of 2)
         if (num_waypoints >= MAX_WAYPOINTS - 3) break; 
         
         if (moving_up) {
-            nav_waypoints[num_waypoints++] = {x, margin};          // Start of row
-            nav_waypoints[num_waypoints++] = {x, mid_y};           // Stop halfway up for UWB check
-            nav_waypoints[num_waypoints++] = {x, height - margin}; // End of row
+            nav_waypoints[num_waypoints++] = {x, margin};          
+            nav_waypoints[num_waypoints++] = {x, mid_y};           
+            nav_waypoints[num_waypoints++] = {x, height - margin}; 
         } else {
-            nav_waypoints[num_waypoints++] = {x, height - margin}; // Start of row
-            nav_waypoints[num_waypoints++] = {x, mid_y};           // Stop halfway down for UWB check
-            nav_waypoints[num_waypoints++] = {x, margin};          // End of row
+            nav_waypoints[num_waypoints++] = {x, height - margin}; 
+            nav_waypoints[num_waypoints++] = {x, mid_y};           
+            nav_waypoints[num_waypoints++] = {x, margin};          
         }
         
-        moving_up = !moving_up; // Flip direction for the next column
+        moving_up = !moving_up;
     }
 }
 
 // --- Wheelbase Calibration ---
 // Robot should spin exactly 360 degrees in place for measurement
 void calibrateTurnRadius() {
-    // Reset pulse counts safely
     noInterrupts();
     g_leftPulseCount = 0;
     g_rightPulseCount = 0;
     interrupts();
 
-    // Spin for a fixed number of pulses
     const uint32_t TARGET_PULSES = 200;
     WebSerial.println("Starting calibration spin...");
     moveFunction(RIGHT, 80);
@@ -238,46 +237,35 @@ void calibrateTurnRadius() {
 
     WebSerial.printf("Calibration Complete. Left: %lu  Right: %lu pulses\n", 
                      g_leftPulseCount, g_rightPulseCount);
-    WebSerial.println("Measure actual rotation degrees to calculate effective wheelbase.");
 }
 
 // --- Navigation Logic ---
-// Returns TRUE when the robot successfully reaches the target coordinates
 bool navigateToWaypoint(float x, float y, float heading) {
-    // Throttle navigation updates to avoid overwhelming the motor controllers
     if(millis() - lastNavUpdate < 100) return false;  
     lastNavUpdate = millis();
 
     waypoint wp = nav_waypoints[waypoint_index];
-    
-    // Calculate distance to the target using the Pythagorean theorem
     float dist = sqrt(pow(wp.x - x, 2) + pow(wp.y - y, 2));
 
     if(dist < 0.25f) { 
-        return true; // We arrived! Trigger the state machine to stop and settle.
+        return true; 
     }
 
-    // Calculate desired heading using arc-tangent
     float desired = atan2(wp.y - y, wp.x - x);
     float error = desired - heading;
     
-    // Normalize the angle to keep the math within standard circular bounds
     while (error > PI) error -= 2 * PI;
     while (error < -PI) error += 2 * PI;
     float absError = fabs(error);
 
-    // If facing the wrong way, stop and rotate in place
-    if(absError > 0.25f) { // ~14 degrees of error
-        
-        // Proportional speed that scales DOWN as error shrinks
-        const int MIN_TURN = 70;   // Minimum power to overcome grass friction
-        const int MAX_TURN = 160;  // Maximum power to prevent spinning out
+    if(absError > 0.25f) { 
+        const int MIN_TURN = 70;   
+        const int MAX_TURN = 160;  
         
         float t = (absError - 0.25f) / (PI - 0.25f); 
         t = constrain(t, 0.0f, 1.0f);
         int turnSpeed = MIN_TURN + (int)(t * (MAX_TURN - MIN_TURN));
 
-        // Brief stop before turning reduces chassis rocking momentum
         moveFunction(STOP, 0);      
         vTaskDelay(pdMS_TO_TICKS(30)); 
 
@@ -287,18 +275,15 @@ bool navigateToWaypoint(float x, float y, float heading) {
             moveFunction(RIGHT, turnSpeed);
     }
     else {
-        // Heading is roughly correct: drive forward with gentle differential correction
         const int BASE_SPEED = 200;
         const float STEER_GAIN = 40.0f;
         int correction = (int)(error * STEER_GAIN);
 
-        // Clamp the correction so one wheel doesn't stop completely
         correction = constrain(correction, -60, 60);
 
         int leftSpeed  = BASE_SPEED - correction;
         int rightSpeed = BASE_SPEED + correction;
 
-        // Apply differential drive directly to the motor driver pins
         int leftPwm  = constrain((leftSpeed  * MAX_DUTY) / 100, 0, MAX_DUTY);
         int rightPwm = constrain((rightSpeed * MAX_DUTY) / 100, 0, MAX_DUTY);
 
@@ -365,7 +350,10 @@ void updateDeadReckoning() {
     float sRight = float(dRight) * METERS_PER_PULSE * float(rightDir);
 
     float dCenter = 0.5f * (sLeft + sRight);
-    float dTheta = (sRight - sLeft) / WHEEL_BASE_M;
+    
+    // Utilize the dynamically updated wheelbase variable
+    float dTheta = (sRight - sLeft) / g_wheelBase;
+    
     float thetaMid = g_est.est_heading + 0.5f * dTheta;
 
     g_est.est_x += dCenter * cosf(thetaMid);
@@ -378,13 +366,11 @@ void updateDeadReckoning() {
 void correctEstimateWithUWB() {
     float uwbX, uwbY;
 
-    // Averages the last 10 UWB packets from the buffer
     if(!computeWeightedPosition(uwbX, uwbY)) return;
 
     g_est.uwb_x = uwbX;
     g_est.uwb_y = uwbY;
 
-    // Overwrite the drifting dead reckoning calculation with the true UWB location
     g_est.est_x = (1.0f - UWB_CORRECTION_GAIN) * g_est.est_x + UWB_CORRECTION_GAIN * uwbX;
     g_est.est_y = (1.0f - UWB_CORRECTION_GAIN) * g_est.est_y + UWB_CORRECTION_GAIN * uwbY;
 }
@@ -419,16 +405,12 @@ static void odometryTask(void *param) {
         updateDeadReckoning();
 
         if (g_isMowing && !obstacleStop) {
-            
-            // Wake the robot up if the app sends the Resume command
             if (g_state == STATE_IDLE) {
                 g_state = STATE_DRIVING;
             }
 
             switch (g_state) {
-                
                 case STATE_DRIVING:
-                    // Continuously returns true when the target is hit
                     if (navigateToWaypoint(g_est.est_x, g_est.est_y, g_est.est_heading)) {
                         moveFunction(STOP, 0);
                         WebSerial.println("Target reached. Settling chassis...");
@@ -439,7 +421,6 @@ static void odometryTask(void *param) {
 
                 case STATE_SETTLING:
                     moveFunction(STOP, 0);
-                    // Wait 1 second for physical bouncing to stop
                     if (millis() - g_stateTimer > 1000) { 
                         WebSerial.println("Taking stationary UWB measurements...");
                         g_state = STATE_CORRECTING;
@@ -449,7 +430,6 @@ static void odometryTask(void *param) {
 
                 case STATE_CORRECTING:
                     moveFunction(STOP, 0);
-                    // Wait 1.5 seconds to gather clean, averaged UWB radio packets
                     if (millis() - g_stateTimer > 1500) { 
                         correctEstimateWithUWB();
                         WebSerial.println("Position corrected via UWB.");
@@ -476,11 +456,11 @@ static void odometryTask(void *param) {
                     break;
             }
         } else {
-            // Failsafe: Ensure motors are dead if mowing is paused or an obstacle is hit
             moveFunction(STOP, 0);
             g_state = STATE_IDLE;
         }
-        vTaskDelay(pdMS_TO_TICKS(20)); // Delay managed by the Real-Time Operating System (RTOS)
+        // Timing handled by the Real-Time Operating System (RTOS)
+        vTaskDelay(pdMS_TO_TICKS(20)); 
     }
 }
 
@@ -501,7 +481,6 @@ static void PositionUpdateTask(void *param) {
             g_robot.y_m = p.y;
             g_robot.last_uwb_ms = p.t_ms;
 
-            // Simply record the UWB data to the buffer. Do NOT trigger a correction.
             xSemaphoreTake(g_posMutex, portMAX_DELAY);
             posBuffer[g_posHead].x = p.x;
             posBuffer[g_posHead].y = p.y;
@@ -517,6 +496,7 @@ static void PositionUpdateTask(void *param) {
 // --- Setup ---
 void setup() {
     Serial.begin(115200);
+    // Serial Peripheral Interface (SPI) configuration
     SPI.begin(14, 32, 13, PIN_SS); 
     delay(200);
 
@@ -539,7 +519,6 @@ void setup() {
     
     Serial.println("\nIP: " + WiFi.localIP().toString());
 
-    // Application Programming Interface (API) Security configuration
     DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
     
     server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -558,14 +537,27 @@ void setup() {
             JsonDocument doc; deserializeJson(doc, data);
             String cmd = doc["command"];
             
-            // App commands linked directly to the robot's state machine
             if (cmd == "resume") {
                 g_isMowing = true;
             } else if (cmd == "pause") {
                 g_isMowing = false;
             } else if (cmd == "calibrate") {
                 g_state = STATE_CALIBRATING;
-                g_isMowing = true; // Engage motor tasks
+                g_isMowing = true; 
+            }
+            
+            request->send(200, "application/json", "{\"success\":true}");
+    });
+
+    // New Settings Endpoint for Dynamic Wheelbase Updates
+    server.on("/api/settings", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL, 
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
+            JsonDocument doc; 
+            deserializeJson(doc, data);
+            
+            if (doc.containsKey("wheelbase")) {
+                g_wheelBase = doc["wheelbase"];
+                WebSerial.printf("Wheelbase updated via app to: %f\n", g_wheelBase);
             }
             
             request->send(200, "application/json", "{\"success\":true}");
@@ -573,7 +565,7 @@ void setup() {
 
     server.begin();
 
-    // Start Real-Time Operating System (RTOS) Tasks
+    // Start RTOS Tasks
     xTaskCreatePinnedToCore(odometryTask, "Odom", 4096, NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(PositionUpdateTask, "PosUpdate", 4096, NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(uwbTask, "UWB", 8192, NULL, 3, NULL, 1);
