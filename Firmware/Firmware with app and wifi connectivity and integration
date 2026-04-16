@@ -47,6 +47,8 @@ float g_fieldHeight = 15.0;
 
 static volatile bool obstacleStop = false;
 
+bool g_uwbInitialized = false;
+
 // --- Motion & Navigation Constants ---
 #define MAX_DUTY 55            // Pulse Width Modulation (PWM) limit for motor power (0-255)
 #define MAX_SPEED_MPS 0.8f     // Meters per second
@@ -512,6 +514,7 @@ void setup() {
     g_posQueue = xQueueCreate(10, sizeof(PositionPacket));
 
     initDw1000();
+    g_uwbInitialized = true; // Only reaches this if init didn't hang
     initEspNow();
 
     WiFi.begin(SSID, PASSPHRASE);
@@ -576,4 +579,29 @@ void loop() {}
 // --- Internal Helper Functions ---
 static void initDw1000() { /* Unchanged Decawave Setup */ }
 static void initEspNow() { /* Unchanged ESP-NOW Setup */ }
-static void uwbTask(void *param) { /* Unchanged UWB Ranging Task */ }
+static void uwbTask(void *param) {
+    for (;;) {
+        if (g_uwbInitialized) {
+            // Power Management: Put radio to sleep between blinks
+            DW1000Ng::deepSleep();
+            
+            // Respect the blink rate (currently set to 200ms in your code)
+            vTaskDelay(pdMS_TO_TICKS(g_blinkRateMs));
+
+            // Wake up and prepare for transmission
+            DW1000Ng::spiWakeup();
+            DW1000Ng::setTransmitWait4LDE(true);
+
+            // Execute the Localization protocol
+            // This function handles the high-level math to find (x, y)
+            if (DW1000NgRTLS::tagTwrLocalize(1500)) {
+                // Successful range! 
+                // The library stores the result internally, and your 
+                // PositionUpdateTask will pick up the resulting data.
+            }
+        } else {
+            // Hardware isn't ready; wait and let the CPU breathe
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
+}
