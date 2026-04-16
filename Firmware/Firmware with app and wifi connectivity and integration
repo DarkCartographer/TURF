@@ -33,7 +33,7 @@ float g_fieldHeight = 15.0;
 #define START_X 0.4f
 #define START_Y 0.4f
 
-// Motor Driver Pins
+// Motor Driver Pins (Standard ESP32 Architecture)
 #define LEFT_IN1 18
 #define LEFT_IN2 19
 #define RIGHT_IN1 21
@@ -161,7 +161,7 @@ void IRAM_ATTR rightHallISR() {
 AsyncWebServer server(80);
 
 // --- Path Generation ---
-#define MAX_WAYPOINTS 200 
+#define MAX_WAYPOINTS 400 // Increased to accommodate the new midpoints
 waypoint nav_waypoints[MAX_WAYPOINTS];
 int waypoint_index = 0;
 int num_waypoints = 0;
@@ -187,16 +187,24 @@ void generateMowingPath(float width, float height) {
     waypoint_index = 0;
     bool moving_up = true;
     
+    // Calculate the exact center of the Y-axis
+    float mid_y = height / 2.0f; 
+    
     for (float x = margin; x <= (width - margin); x += cut_width) {
-        if (num_waypoints >= MAX_WAYPOINTS - 2) break;
+        // Prevent memory overflow (we now add 3 waypoints per column instead of 2)
+        if (num_waypoints >= MAX_WAYPOINTS - 3) break; 
+        
         if (moving_up) {
-            nav_waypoints[num_waypoints++] = {x, margin};
-            nav_waypoints[num_waypoints++] = {x, height - margin};
+            nav_waypoints[num_waypoints++] = {x, margin};          // Start of row
+            nav_waypoints[num_waypoints++] = {x, mid_y};           // Stop halfway up for UWB check
+            nav_waypoints[num_waypoints++] = {x, height - margin}; // End of row
         } else {
-            nav_waypoints[num_waypoints++] = {x, height - margin};
-            nav_waypoints[num_waypoints++] = {x, margin};
+            nav_waypoints[num_waypoints++] = {x, height - margin}; // Start of row
+            nav_waypoints[num_waypoints++] = {x, mid_y};           // Stop halfway down for UWB check
+            nav_waypoints[num_waypoints++] = {x, margin};          // End of row
         }
-        moving_up = !moving_up;
+        
+        moving_up = !moving_up; // Flip direction for the next column
     }
 }
 
@@ -423,7 +431,7 @@ static void odometryTask(void *param) {
                     // Continuously returns true when the target is hit
                     if (navigateToWaypoint(g_est.est_x, g_est.est_y, g_est.est_heading)) {
                         moveFunction(STOP, 0);
-                        WebSerial.println("Row complete. Settling chassis...");
+                        WebSerial.println("Target reached. Settling chassis...");
                         g_state = STATE_SETTLING;
                         g_stateTimer = millis();
                     }
@@ -453,7 +461,7 @@ static void odometryTask(void *param) {
                             WebSerial.println("All waypoints complete.");
                         } else {
                             g_state = STATE_DRIVING;
-                            WebSerial.println("Starting next row.");
+                            WebSerial.println("Starting next row segment.");
                         }
                     }
                     break;
@@ -472,7 +480,7 @@ static void odometryTask(void *param) {
             moveFunction(STOP, 0);
             g_state = STATE_IDLE;
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(20)); // Delay managed by the Real-Time Operating System (RTOS)
     }
 }
 
