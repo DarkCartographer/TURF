@@ -82,6 +82,9 @@ float g_wheelBase = 0.25f;
 float g_fieldWidth  = 5.0f;
 float g_fieldHeight = 5.0f;
 #define MAX_WAYPOINTS 100
+// At the top of the sketch, tune this until spin is visually ~360°
+// Start low and increase — current value is a rough starting point
+int32_t g_calibrationPulses = 800;
 
 // -----------------------------------------------------------------------
 // Motion Command Defines (Sketch 2 style — int, not enum)
@@ -406,7 +409,7 @@ void navigateToWaypoint(float x, float y, float heading) {
     float error   = wrapAngle(desired - heading);
     float absErr  = fabsf(error);
 
-    int turnSpeed = 120 + (int)((absErr / PI) * (225 - 120));
+    int turnSpeed = 180 + (int)((absErr / PI) * (225 - 180));
     if (turnSpeed > 225) turnSpeed = 225;
 
     if      (absErr < 0.1f) moveFunction(FORWARD, 225);
@@ -544,7 +547,6 @@ static void odometryTask(void *param) {
                 }
 
                 case STATE_SETTLING:
-                    // Pause 1 s at waypoint before advancing
                     vTaskDelay(pdMS_TO_TICKS(1000));
                     g_state = STATE_CORRECTING;
                     break;
@@ -555,19 +557,37 @@ static void odometryTask(void *param) {
                                   waypoint_index, num_waypoints);
                     WebSerial.printf("Next WP: %d / %d\n",
                                      waypoint_index, num_waypoints);
-                    if (waypoint_index >= num_waypoints) {
-                        g_isMowing = false;
-                        g_state    = STATE_IDLE;
-                    } else {
-                        g_state = STATE_DRIVING;
-                    }
+                    g_state = (waypoint_index >= num_waypoints) ? STATE_IDLE : STATE_DRIVING;
+                    if (g_state == STATE_IDLE) g_isMowing = false;
                     break;
 
-                case STATE_CALIBRATING:
-                    // Spin is initiated by /api/command calibrate
-                    // and runs until the app sends pause or resume
-                    break;
-            }
+                ccase STATE_CALIBRATING: {
+    noInterrupts();
+    int32_t startLeft  = g_leftSignedCount;
+    int32_t startRight = g_rightSignedCount;
+    interrupts();
+
+    moveFunction(RIGHT, 150);
+
+    while (true) {
+        noInterrupts();
+        int32_t dLeft  = abs(g_leftSignedCount  - startLeft);
+        int32_t dRight = abs(g_rightSignedCount - startRight);
+        interrupts();
+        if (dLeft >= g_calibrationPulses && dRight >= g_calibrationPulses) break;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    moveFunction(STOP, 0);
+    g_isMowing = false;
+    g_state    = STATE_IDLE;
+
+    Serial.println("[CAL] Spin complete. Awaiting wheelbase from app.");
+    WebSerial.println("[CAL] Spin complete.");
+    break;
+}
+
+            } // end switch
         } else {
             moveFunction(STOP, 0);
         }
@@ -688,7 +708,7 @@ void setupAPI() {
         else if (c == "calibrate") {
             g_state    = STATE_CALIBRATING;
             g_isMowing = true;
-            moveFunction(RIGHT, 150);
+            moveFunction(RIGHT, 225);
             Serial.println("[CMD] Calibration spin started");
             WebSerial.println("[CMD] Calibrating...");
         }
@@ -708,25 +728,30 @@ void setupAPI() {
 
     // POST /api/settings — update wheelbase at runtime
     server.on("/api/settings", HTTP_POST,
-    [](AsyncWebServerRequest *req){}, NULL,
-    [](AsyncWebServerRequest *req, uint8_t *data,
-       size_t len, size_t index, size_t total) {
+[](AsyncWebServerRequest *req){}, NULL,
+[](AsyncWebServerRequest *req, uint8_t *data,
+   size_t len, size_t index, size_t total) {
 
-        if (index + len != total) return;
+    if (index + len != total) return;
 
-        JsonDocument d;
-        deserializeJson(d, data);
+    JsonDocument d;
+    deserializeJson(d, data);
 
-        if (d.containsKey("wheelbase")) {
-            g_wheelBase = d["wheelbase"].as<float>();
-            g_state     = STATE_IDLE;
-            moveFunction(STOP, 0);
-            Serial.printf("[SETTINGS] Wheelbase → %.4fm\n", g_wheelBase);
-            WebSerial.printf("Wheelbase updated: %.4fm\n", g_wheelBase);
-        }
+    if (d.containsKey("wheelbase")) {
+        g_wheelBase = d["wheelbase"].as<float>();
+        g_state     = STATE_IDLE;
+        moveFunction(STOP, 0);
+        Serial.printf("[SETTINGS] Wheelbase → %.4fm\n", g_wheelBase);
+        WebSerial.printf("Wheelbase updated: %.4fm\n", g_wheelBase);
+    }
+    if (d.containsKey("calibrationPulses")) {
+        g_calibrationPulses = d["calibrationPulses"].as<int32_t>();
+        Serial.printf("[SETTINGS] Calibration pulses → %d\n", g_calibrationPulses);
+        WebSerial.printf("Calibration pulses: %d\n", g_calibrationPulses);
+    }
 
-        req->send(200, "application/json", "{\"success\":true}");
-    });
+    req->send(200, "application/json", "{\"success\":true}");
+});
 
     // POST /api/field-config — set field dimensions & regenerate path
     server.on("/api/field-config", HTTP_POST,
