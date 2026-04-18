@@ -1,438 +1,823 @@
-#include <Arduino.h>
+// =====================================================================
+// MERGED SKETCH — Movement from Sketch 2, API from Sketch 1
+//   - Motor control, Hall ISRs, dead reckoning, ultrasonic: Sketch 2
+//   - MAX_DUTY PWM scaling, soft UWB fusion, weighted buffer: Sketch 2
+//   - REST API (/status /command /settings /field-config):   Sketch 1
+//   - State machine (IDLE/DRIVING/SETTLING/CORRECTING):      Sketch 1
+//   - Dynamic path generation, configurable wheelbase:       Sketch 1
+//   - Serial + WebSerial dual monitoring:                    Both
+//   - UWB task commented out pending field name resolution
+// =====================================================================
 
-// Ultra-Wideband (UWB) & Networking Libraries
+#include <Arduino.h>
 #include <DW1000Ng.hpp>
 #include <DW1000NgUtils.hpp>
 #include <DW1000NgTime.hpp>
 #include <DW1000NgConstants.hpp>
 #include <DW1000NgRanging.hpp>
-#include <DW1000NgRTLS.hpp> // Real-Time Location System (RTLS)
+#include <DW1000NgRTLS.hpp>
 #include <WiFi.h>
-#include <AsyncTCP.h> // Asynchronous Transmission Control Protocol (TCP)
+#include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <WebSerial.h>
-#include <ArduinoJson.h> // JavaScript Object Notation (JSON)
+#include <esp_now.h>
+#include <ArduinoJson.h>
+#include <math.h>
 
-// --- Network & Hardware Identity ---
-#define SSID "SAM-WINDOWS 9657"
-#define PASSPHRASE "0H13{m56"
-#define RTLS_APP_ID 10
-const char EUI[] = "AA:BB:CC:DD:EE:FF:00:00"; // Extended Unique Identifier (EUI)
+// -----------------------------------------------------------------------
+// Network
+// -----------------------------------------------------------------------
+#define SSID       "tulsiwifi"
+#define PASSPHRASE "letsdance"
+static const char EUI[] = "AA:BB:CC:DD:EE:FF:00:00";
 
-// --- Pin Definitions ---
+// -----------------------------------------------------------------------
+// Start Position
+// -----------------------------------------------------------------------
+#define START_X 0.5f
+#define START_Y 0.5f
+
+// -----------------------------------------------------------------------
+// Pin Definitions
+// -----------------------------------------------------------------------
 static constexpr uint8_t PIN_RST = 27;
-static constexpr uint8_t PIN_SS  = 4; // Slave Select (SS)
+static constexpr uint8_t PIN_SS  = 4;
 
-// Motor Pins (Shared GPIO 18/19 with Serial Peripheral Interface - SPI)
-#define LEFT_IN1 21  
-#define LEFT_IN2 22  
-#define RIGHT_IN1 18  // Shared with SPI Serial Clock (SCK)
-#define RIGHT_IN2 19  // Shared with SPI Master In Slave Out (MISO)
+#define LEFT_IN1  21   // Enable (PWM)
+#define LEFT_IN2  22   // Phase  (Direction)
+#define RIGHT_IN1 18   // Enable (PWM)
+#define RIGHT_IN2 19   // Phase  (Direction)
 
-// Sensors
-#define LEFT_HALL_PIN 32
+#define LEFT_HALL_PIN  32
 #define RIGHT_HALL_PIN 25
+#define US_TRIG_PIN    26
+#define US_ECHO_PIN    35
 
-// --- Strongly Typed Motion Enum ---
-enum MoveAction {
-    FORWARD,
-    BACKWARD,
-    LEFT,
-    RIGHT,
-    STOP
-};
+// -----------------------------------------------------------------------
+// PWM & Speed
+// -----------------------------------------------------------------------
+#define PWM_FREQ  20000
+#define PWM_RES   8
+#define MAX_DUTY  55    // Cap at 55% duty cycle — proven safe in Sketch 2
+#define TURN_BIAS 8     // Extra PWM added during turns to prevent stall
 
-// --- Navigation & State ---
-enum MowerState { 
-    STATE_IDLE, 
-    STATE_DRIVING, 
-    STATE_SETTLING, 
-    STATE_CORRECTING, 
-    STATE_CALIBRATING 
-};
+// -----------------------------------------------------------------------
+// Physical Constants
+// -----------------------------------------------------------------------
+#define MAX_SPEED_MPS      0.381f
+#define UWB_GATE_MARGIN_M  0.21f
+#define MIN_UWB_GATE_M     0.15f   // Floor gate so startup isn't zero-width
+#define UWB_CORRECTION_GAIN 0.02f  // Soft UWB fusion gain (0=ignore UWB, 1=fully trust)
 
-static MowerState g_state = STATE_IDLE;
-bool g_isMowing = false;
-volatile bool obstacleStop = false;
-bool g_uwbInitialized = false;
+// Odometry — calibrated values from Sketch 2
+#define LEFT_METERS_PER_PULSE  0.0006674586f
+#define RIGHT_METERS_PER_PULSE 0.0006674586f
 
-float g_wheelBase = 0.219075f;
-float g_fieldWidth = 5.0f;
+// Wheelbase is a runtime variable so /api/settings can update it
+float g_wheelBase = 0.25f;
+
+// -----------------------------------------------------------------------
+// Field / Path
+// -----------------------------------------------------------------------
+float g_fieldWidth  = 5.0f;
 float g_fieldHeight = 5.0f;
-#define MAX_DUTY 55 // Maximum Pulse Width Modulation (PWM) duty cycle
-#define PWM_FREQ 20000 // Pulse Width Modulation frequency in Hertz
-#define PWM_RES 8 // 8-bit resolution (0-255)
-
-// --- Waypoints & Positioning ---
-struct waypoint { float x; float y; };
 #define MAX_WAYPOINTS 100
-waypoint nav_waypoints[MAX_WAYPOINTS];
-int waypoint_index = 0;
-int num_waypoints = 0;
 
-struct PositionEstimator {
-    float x = 0.4f, y = 0.4f, heading = 0.0f;
+// -----------------------------------------------------------------------
+// Motion Command Defines (Sketch 2 style — int, not enum)
+// -----------------------------------------------------------------------
+#define FORWARD  0
+#define BACKWARD 1
+#define LEFT     2
+#define RIGHT    3
+#define STOP     4
+
+// -----------------------------------------------------------------------
+// System State (from Sketch 1)
+// -----------------------------------------------------------------------
+enum MowerState {
+    STATE_IDLE,
+    STATE_DRIVING,
+    STATE_SETTLING,
+    STATE_CORRECTING,
+    STATE_CALIBRATING
 };
-PositionEstimator g_est; 
-SemaphoreHandle_t g_posMutex; // Mutual Exclusion (Mutex) to prevent data corruption
 
-volatile unsigned long g_leftPulseCount = 0, g_rightPulseCount = 0;
+enum WheelDir { WHEEL_REV = -1, WHEEL_STOP = 0, WHEEL_FWD = 1 };
+
+static MowerState g_state    = STATE_IDLE;
+static bool       g_isMowing = false;
+static volatile bool obstacleStop = false;
+
+// -----------------------------------------------------------------------
+// Hall Sensor State
+// -----------------------------------------------------------------------
+#define HALL_DEBOUNCE_US 100
+
+volatile int32_t       g_leftSignedCount      = 0;
+volatile int32_t       g_rightSignedCount     = 0;
+volatile unsigned long lastLeftAcceptedPulse  = 0;
+volatile unsigned long lastRightAcceptedPulse = 0;
+volatile int8_t        g_leftWheelDir         = WHEEL_STOP;
+volatile int8_t        g_rightWheelDir        = WHEEL_STOP;
+
+// -----------------------------------------------------------------------
+// UWB Blink Rate
+// -----------------------------------------------------------------------
 static volatile uint32_t g_blinkRateMs = 200;
 
-// --- Motor Control Logic ---
+// -----------------------------------------------------------------------
+// Structs
+// -----------------------------------------------------------------------
+#define SAMPLE_COUNT 4
 
-void moveFunction(MoveAction action, int speed) {
-    int pwm = (speed * MAX_DUTY) / 100;
+typedef struct { float x; float y; uint32_t t_ms; } PositionPacket;
+typedef struct { float x; float y; uint32_t t_ms; } PositionSample;
+typedef struct { float x; float y; }                 waypoint;
+typedef struct { float x_m; float y_m; uint32_t last_uwb_ms; } RobotPose;
 
-    switch (action) {
-        case FORWARD:
-            ledcWrite(LEFT_IN1, pwm); digitalWrite(LEFT_IN2, HIGH);
-            ledcWrite(RIGHT_IN1, pwm); digitalWrite(RIGHT_IN2, HIGH);
-            break;
-        case BACKWARD:
-            ledcWrite(LEFT_IN1, pwm); digitalWrite(LEFT_IN2, LOW);
-            ledcWrite(RIGHT_IN1, pwm); digitalWrite(RIGHT_IN2, LOW);
-            break;
-        case LEFT:
-            // Differential Turn: Left back, Right forward
-            ledcWrite(LEFT_IN1, pwm); digitalWrite(LEFT_IN2, LOW);
-            ledcWrite(RIGHT_IN1, pwm); digitalWrite(RIGHT_IN2, HIGH);
-            break;
-        case RIGHT:
-            // Differential Turn: Left forward, Right back
-            ledcWrite(LEFT_IN1, pwm); digitalWrite(LEFT_IN2, HIGH);
-            ledcWrite(RIGHT_IN1, pwm); digitalWrite(RIGHT_IN2, LOW);
-            break;
-        case STOP:
-        default:
-            ledcWrite(LEFT_IN1, 0); digitalWrite(LEFT_IN2, LOW);
-            ledcWrite(RIGHT_IN1, 0); digitalWrite(RIGHT_IN2, LOW);
-            break;
-    }
+typedef struct {
+    float uwb_x, uwb_y;        // last accepted UWB position
+    float est_x, est_y;        // fused estimate
+    float est_heading;
+    int32_t  last_left_count;
+    int32_t  last_right_count;
+    uint32_t last_update_ms;
+} PositionEstimator;
+
+static RobotPose         g_robot;
+static PositionEstimator g_est;
+
+PositionSample posBuffer[SAMPLE_COUNT];
+static int g_posHead  = 0;
+static int g_posCount = 0;
+
+waypoint nav_waypoints[MAX_WAYPOINTS];
+int waypoint_index = 0;
+int num_waypoints  = 0;
+
+// -----------------------------------------------------------------------
+// Synchronization
+// -----------------------------------------------------------------------
+static SemaphoreHandle_t g_posMutex;
+static QueueHandle_t     g_posQueue = nullptr;
+
+// -----------------------------------------------------------------------
+// DW1000 Config (from Sketch 2)
+// -----------------------------------------------------------------------
+device_configuration_t DEFAULT_CONFIG = {
+    false, true, false, true, false,
+    SFDMode::DECAWAVE_SFD, Channel::CHANNEL_1,
+    DataRate::RATE_850KBPS, PulseFrequency::FREQ_16MHZ,
+    PreambleLength::LEN_256, PreambleCode::CODE_3
+};
+
+static frame_filtering_configuration_t TAG_FRAME_FILTER_CONFIG = {
+    false, false, true, false, false, false, false, false
+};
+
+static sleep_configuration_t SLEEP_CONFIG = {
+    false, false, false, true, true, true, false, true
+};
+
+AsyncWebServer server(80);
+
+
+// =======================================================================
+// ISRs
+// =======================================================================
+
+void IRAM_ATTR leftHallISR() {
+    unsigned long now = micros();
+    if ((now - lastLeftAcceptedPulse) < HALL_DEBOUNCE_US) return;
+    lastLeftAcceptedPulse = now;
+    g_leftSignedCount += g_leftWheelDir;
 }
 
-// --- Navigation Functions ---
+void IRAM_ATTR rightHallISR() {
+    unsigned long now = micros();
+    if ((now - lastRightAcceptedPulse) < HALL_DEBOUNCE_US) return;
+    lastRightAcceptedPulse = now;
+    g_rightSignedCount += g_rightWheelDir;
+}
+
+
+// =======================================================================
+// Math Helpers
+// =======================================================================
+
+static float wrapAngle(float a) {
+    while (a >  PI) a -= 2.0f * PI;
+    while (a < -PI) a += 2.0f * PI;
+    return a;
+}
+
+float distanceToWaypoint(float x, float y, waypoint wp) {
+    float dx = wp.x - x, dy = wp.y - y;
+    return sqrtf(dx*dx + dy*dy);
+}
+
+float desiredHeading(float x, float y, waypoint wp) {
+    return atan2f(wp.y - y, wp.x - x);
+}
+
+
+// =======================================================================
+// Path Generation (from Sketch 1)
+// =======================================================================
 
 void generateMowingPath(float width, float height) {
-    num_waypoints = 0;
-    float step = 0.4f; // 40cm overlap
+    num_waypoints  = 0;
+    waypoint_index = 0;
+    float step = 0.4f;
     bool up = true;
-    for (float x = 0.5f; x < width; x += step) {
+
+    for (float x = 0.5f + step; x < width; x += step) {
         if (num_waypoints >= MAX_WAYPOINTS - 2) break;
         nav_waypoints[num_waypoints++] = {x, up ? 0.5f : height - 0.5f};
         nav_waypoints[num_waypoints++] = {x, up ? height - 0.5f : 0.5f};
         up = !up;
     }
+
+    Serial.printf("[PATH] Generated %d waypoints for %.1fm x %.1fm field\n",
+                  num_waypoints, width, height);
+    WebSerial.printf("[PATH] %d waypoints, %.1fx%.1fm\n",
+                     num_waypoints, width, height);
 }
 
-bool navigateToWaypoint() {
+
+// =======================================================================
+// Movement  — Sketch 2 version with MAX_DUTY scaling
+// =======================================================================
+
+void moveFunction(int action, int speed) {
+    if (obstacleStop && action != STOP) return;
+
+    int pwm = (speed * MAX_DUTY) / 100;
+
+    switch (action) {
+        case FORWARD:
+            ledcWrite(LEFT_IN1,  pwm); digitalWrite(LEFT_IN2,  HIGH);
+            ledcWrite(RIGHT_IN1, pwm); digitalWrite(RIGHT_IN2, HIGH);
+            g_leftWheelDir  = WHEEL_FWD;
+            g_rightWheelDir = WHEEL_FWD;
+            break;
+
+        case BACKWARD:
+            ledcWrite(LEFT_IN1,  pwm); digitalWrite(LEFT_IN2,  LOW);
+            ledcWrite(RIGHT_IN1, pwm); digitalWrite(RIGHT_IN2, LOW);
+            g_leftWheelDir  = WHEEL_REV;
+            g_rightWheelDir = WHEEL_REV;
+            break;
+
+        case LEFT:
+            ledcWrite(LEFT_IN1,  pwm + TURN_BIAS); digitalWrite(LEFT_IN2,  LOW);
+            ledcWrite(RIGHT_IN1, pwm + TURN_BIAS); digitalWrite(RIGHT_IN2, HIGH);
+            g_leftWheelDir  = WHEEL_REV;
+            g_rightWheelDir = WHEEL_FWD;
+            break;
+
+        case RIGHT:
+            ledcWrite(LEFT_IN1,  pwm + TURN_BIAS); digitalWrite(LEFT_IN2,  HIGH);
+            ledcWrite(RIGHT_IN1, pwm + TURN_BIAS); digitalWrite(RIGHT_IN2, LOW);
+            g_leftWheelDir  = WHEEL_FWD;
+            g_rightWheelDir = WHEEL_REV;
+            break;
+
+        case STOP:
+        default:
+            ledcWrite(LEFT_IN1,  0); digitalWrite(LEFT_IN2,  LOW);
+            ledcWrite(RIGHT_IN1, 0); digitalWrite(RIGHT_IN2, LOW);
+            g_leftWheelDir  = WHEEL_STOP;
+            g_rightWheelDir = WHEEL_STOP;
+            break;
+    }
+}
+
+
+// =======================================================================
+// Dead Reckoning  — Sketch 2 logic, mutex-protected writes
+// =======================================================================
+
+void updateDeadReckoning() {
+    int32_t leftCount, rightCount;
+    noInterrupts();
+    leftCount  = g_leftSignedCount;
+    rightCount = g_rightSignedCount;
+    interrupts();
+
+    int32_t dLeft  = leftCount  - g_est.last_left_count;
+    int32_t dRight = rightCount - g_est.last_right_count;
+    g_est.last_left_count  = leftCount;
+    g_est.last_right_count = rightCount;
+
+    if (dLeft == 0 && dRight == 0) return;
+
+    float sLeft    = float(dLeft)  * LEFT_METERS_PER_PULSE;
+    float sRight   = float(dRight) * RIGHT_METERS_PER_PULSE;
+    float dCenter  = 0.5f * (sLeft + sRight);
+    float dTheta   = (sRight - sLeft) / g_wheelBase;
+    float thetaMid = g_est.est_heading + 0.5f * dTheta;
+
     xSemaphoreTake(g_posMutex, portMAX_DELAY);
-    if (waypoint_index >= num_waypoints) { xSemaphoreGive(g_posMutex); return true; }
-    
-    waypoint wp = nav_waypoints[waypoint_index];
-    float dx = wp.x - g_est.x;
-    float dy = wp.y - g_est.y;
-    float head = g_est.heading;
+    g_est.est_x       += dCenter * cosf(thetaMid);
+    g_est.est_y       += dCenter * sinf(thetaMid);
+    g_est.est_heading  = wrapAngle(g_est.est_heading + dTheta);
+    xSemaphoreGive(g_posMutex);
+}
+
+
+// =======================================================================
+// UWB Fusion  — Sketch 2 weighted-average + soft-gain correction
+// =======================================================================
+
+bool computeWeightedPosition(float &x_out, float &y_out) {
+    xSemaphoreTake(g_posMutex, portMAX_DELAY);
+    if (g_posCount <= 0) { xSemaphoreGive(g_posMutex); return false; }
+
+    float sumW = 0, sumX = 0, sumY = 0;
+    for (int k = 0; k < g_posCount; k++) {
+        int   idx = (g_posHead - 1 - k + SAMPLE_COUNT) % SAMPLE_COUNT;
+        float w   = float(g_posCount - k);   // newest sample has highest weight
+        sumW += w;
+        sumX += posBuffer[idx].x * w;
+        sumY += posBuffer[idx].y * w;
+    }
     xSemaphoreGive(g_posMutex);
 
-    float dist = sqrt(dx*dx + dy*dy);
-    if (dist < 0.25f) return true; // Waypoint reached
-
-    // Heading calculation using tangent inverse (Trigonometry)
-    float desiredHeading = atan2(dy, dx);
-    float error = desiredHeading - head;
-    
-    // Normalize angle to ensure we turn the shortest way
-    while (error > PI) error -= 2 * PI;
-    while (error < -PI) error += 2 * PI;
-
-    if (fabs(error) > 0.3f) {
-        moveFunction(error > 0 ? LEFT : RIGHT, 75);
-    } else {
-        moveFunction(FORWARD, 85);
-    }
-    return false;
+    x_out = sumX / sumW;
+    y_out = sumY / sumW;
+    return true;
 }
 
-// --- Calibration Function ---
-void calibrateTurnRadius() {
-    Serial.println("\n=== CALIBRATION FUNCTION TRIGGERED ===");
-    
-    noInterrupts();
-    g_leftPulseCount = 0;
-    g_rightPulseCount = 0;
-    interrupts();
-    
-    // Give motors the command to move
-    moveFunction(RIGHT, 80); 
-    
-    // Wait 100 milliseconds to let the initial motor electrical noise settle
-    vTaskDelay(pdMS_TO_TICKS(100)); 
+void correctEstimateWithUWB() {
+    float uwbX, uwbY;
+    if (!computeWeightedPosition(uwbX, uwbY)) return;
 
-    const uint32_t TARGET_PULSES = 450; 
-    uint32_t startTime = millis();
-    
-    while(true) {
-        // Print the sensor values to the Serial Monitor every 100ms
-        Serial.printf("Sensors -> Left: %lu | Right: %lu\n", g_leftPulseCount, g_rightPulseCount);
-        
-        if(g_leftPulseCount >= TARGET_PULSES || g_rightPulseCount >= TARGET_PULSES) {
-            Serial.println("Target pulses reached!");
-            break;
-        }
+    g_est.uwb_x = uwbX;
+    g_est.uwb_y = uwbY;
 
-        // Safety Guard: Stop if it takes longer than 10 seconds
-        if(millis() - startTime > 10000) {
-            Serial.println("ERROR: 10-Second Timeout. Sensors might be disconnected.");
-            break;
-        }
-        
-        vTaskDelay(pdMS_TO_TICKS(100)); 
-    } // End of the while loop
-
-    moveFunction(STOP, 0);
-    Serial.printf("=== CALIBRATION FINISHED IN %lu ms ===\n\n", millis() - startTime);
-} // End of the function
-// --- Square Test ---
-void runSquareTest() {
-    WebSerial.println("--- STARTING SQUARE TEST ---");
-    
-    const int sideDuration = 2000; // 2 seconds forward
-    const int turnDuration = 1200; // Calculated duration for a 90-degree turn
-    const int stopDuration = 500;  // Settling time
-
-    for (int i = 0; i < 4; i++) {
-        WebSerial.printf("Square Side %d\n", i + 1);
-        
-        moveFunction(FORWARD, 225);
-        delay(sideDuration);
-        
-        moveFunction(STOP, 0);
-        delay(stopDuration);
-        
-        moveFunction(RIGHT, 225);
-        delay(turnDuration);
-        
-        moveFunction(STOP, 0);
-        delay(stopDuration);
-    }
-    
-    WebSerial.println("--- SQUARE TEST COMPLETE ---");
+    xSemaphoreTake(g_posMutex, portMAX_DELAY);
+    g_est.est_x = (1.0f - UWB_CORRECTION_GAIN) * g_est.est_x + UWB_CORRECTION_GAIN * uwbX;
+    g_est.est_y = (1.0f - UWB_CORRECTION_GAIN) * g_est.est_y + UWB_CORRECTION_GAIN * uwbY;
+    xSemaphoreGive(g_posMutex);
 }
 
-// --- Real-Time Operating System (RTOS) Tasks ---
+static bool acceptPositionMeasurement(const PositionPacket &p) {
+    float dx   = p.x - g_robot.x_m;
+    float dy   = p.y - g_robot.y_m;
+    float disp = sqrtf(dx*dx + dy*dy);
 
-static void uwbTask(void *param) {
+    uint32_t dt_ms   = p.t_ms - g_robot.last_uwb_ms;
+    float maxAllowed = MAX_SPEED_MPS * (dt_ms * 0.001f) + UWB_GATE_MARGIN_M;
+    if (maxAllowed < MIN_UWB_GATE_M) maxAllowed = MIN_UWB_GATE_M;
+
+    return disp <= maxAllowed;
+}
+
+void initPositionEstimator() {
+    uint32_t now = millis();
+
+    g_est.uwb_x       = START_X;  g_est.uwb_y       = START_Y;
+    g_est.est_x       = START_X;  g_est.est_y       = START_Y;
+    g_est.est_heading = 1.5708f;
+    g_est.last_left_count  = 0;
+    g_est.last_right_count = 0;
+    g_est.last_update_ms   = now;
+
+    for (int i = 0; i < SAMPLE_COUNT; i++)
+        posBuffer[i] = {START_X, START_Y, now};
+
+    g_robot      = {START_X, START_Y, now};
+    g_posHead    = 0;
+    g_posCount   = SAMPLE_COUNT;
+}
+
+
+// =======================================================================
+// Navigation  — Sketch 2 proportional steering
+// =======================================================================
+
+void navigateToWaypoint(float x, float y, float heading) {
+    if (waypoint_index >= num_waypoints) return;
+
+    waypoint wp   = nav_waypoints[waypoint_index];
+    float desired = desiredHeading(x, y, wp);
+    float error   = wrapAngle(desired - heading);
+    float absErr  = fabsf(error);
+
+    int turnSpeed = 120 + (int)((absErr / PI) * (225 - 120));
+    if (turnSpeed > 225) turnSpeed = 225;
+
+    if      (absErr < 0.1f) moveFunction(FORWARD, 225);
+    else if (error  > 0.0f) moveFunction(LEFT,    turnSpeed);
+    else                    moveFunction(RIGHT,   turnSpeed);
+}
+
+
+// =======================================================================
+// ESP-NOW
+// =======================================================================
+
+static void onReceive(const esp_now_recv_info *info,
+                      const uint8_t *incomingData, int len) {
+    (void)info;
+    if (!incomingData || len < (int)sizeof(PositionPacket) || !g_posQueue) return;
+
+    PositionPacket p;
+    memcpy(&p, incomingData, sizeof(p));
+
+    BaseType_t woken = pdFALSE;
+    xQueueSendFromISR(g_posQueue, &p, &woken);
+    if (woken) portYIELD_FROM_ISR();
+}
+
+static void initEspNow() {
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("[ESP-NOW] Init failed — halting");
+        while (true) delay(1000);
+    }
+    esp_now_register_recv_cb(onReceive);
+    Serial.println("[ESP-NOW] Initialized.");
+}
+
+
+// =======================================================================
+// DW1000 Init  (kept from Sketch 2; UWB task is commented out below)
+// =======================================================================
+
+static void initDw1000() {
+    DW1000Ng::initializeNoInterrupt(PIN_SS, PIN_RST);
+    DW1000Ng::applyConfiguration(DEFAULT_CONFIG);
+    DW1000Ng::setTXPower(0x1F1F1F1F);
+    DW1000Ng::enableFrameFiltering(TAG_FRAME_FILTER_CONFIG);
+    DW1000Ng::setEUI(EUI);
+    DW1000Ng::setNetworkId(RTLS_APP_ID);
+    DW1000Ng::setDeviceAddress(5);
+    DW1000Ng::setAntennaDelay(16436);
+    DW1000Ng::applySleepConfiguration(SLEEP_CONFIG);
+    DW1000Ng::setPreambleDetectionTimeout(15);
+    DW1000Ng::setSfdDetectionTimeout(273);
+    DW1000Ng::setReceiveFrameWaitTimeoutPeriod(2000);
+    Serial.println("[DW1000] Initialized.");
+}
+
+
+// =======================================================================
+// FreeRTOS Tasks
+// =======================================================================
+
+// --- Position Update (ESP-NOW receiver) ---
+static void PositionUpdateTask(void *param) {
+    (void)param;
+    PositionPacket p;
+
     for (;;) {
-        if (g_uwbInitialized && (g_state == STATE_SETTLING || g_state == STATE_IDLE)) {
-            DW1000Ng::deepSleep();
-            vTaskDelay(pdMS_TO_TICKS(g_blinkRateMs));
-            DW1000Ng::spiWakeup();
-            
-            // Perform Two-Way Ranging (TWR)
-            RangeInfrastructureResult res = DW1000NgRTLS::tagTwrLocalize(2000);
-            
-            if (res.success) {
-                // X and Y coordinates are determined externally via anchors
-                g_blinkRateMs = res.new_blink_rate;
+        if (xQueueReceive(g_posQueue, &p, portMAX_DELAY) == pdTRUE) {
+
+            if (!acceptPositionMeasurement(p)) {
+                Serial.println("[UWB] Measurement rejected (gate fail)");
+                WebSerial.println("[UWB] Rejected (gate)");
+                continue;
             }
+
+            g_robot = {p.x, p.y, p.t_ms};
+
+            xSemaphoreTake(g_posMutex, portMAX_DELAY);
+            posBuffer[g_posHead] = {p.x, p.y, p.t_ms};
+            int last = g_posHead;
+            g_posHead = (g_posHead + 1) % SAMPLE_COUNT;
+            if (g_posCount < SAMPLE_COUNT) g_posCount++;
+            xSemaphoreGive(g_posMutex);
+
+            correctEstimateWithUWB();
+
+            Serial.printf("[UWB] raw=(%.3f,%.3f)  est=(%.3f,%.3f)  hdg=%.3f\n",
+                p.x, p.y, g_est.est_x, g_est.est_y, g_est.est_heading);
+            WebSerial.printf("UWB(%.3f,%.3f) Est(%.3f,%.3f) Hdg=%.3f\n",
+                p.x, p.y, g_est.est_x, g_est.est_y, g_est.est_heading);
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
+// --- Odometry + State Machine ---
 static void odometryTask(void *param) {
+    (void)param;
+
     for (;;) {
-        if (g_isMowing) {
+        updateDeadReckoning();
+
+        if (g_isMowing && !obstacleStop) {
             switch (g_state) {
-                case STATE_IDLE: 
-                    g_state = STATE_DRIVING; 
+
+                case STATE_IDLE:
+                    g_state = STATE_DRIVING;
                     break;
-                
-                case STATE_DRIVING:
-                    if (navigateToWaypoint()) {
+
+                case STATE_DRIVING: {
+                    if (waypoint_index >= num_waypoints) {
                         moveFunction(STOP, 0);
+                        g_isMowing = false;
+                        g_state    = STATE_IDLE;
+                        Serial.println("[NAV] All waypoints complete.");
+                        WebSerial.println("[NAV] All waypoints complete.");
+                        break;
+                    }
+
+                    xSemaphoreTake(g_posMutex, portMAX_DELAY);
+                    float x = g_est.est_x, y = g_est.est_y, h = g_est.est_heading;
+                    xSemaphoreGive(g_posMutex);
+
+                    waypoint wp = nav_waypoints[waypoint_index];
+                    float dist  = distanceToWaypoint(x, y, wp);
+
+                    if (dist < 0.1f) {
+                        moveFunction(STOP, 0);
+                        Serial.printf("[NAV] Reached WP %d (%.3f,%.3f) hdg=%.3f\n",
+                                      waypoint_index, x, y, h);
+                        WebSerial.printf("WP %d reached. Hdg=%.3f\n", waypoint_index, h);
                         g_state = STATE_SETTLING;
+                    } else {
+                        navigateToWaypoint(x, y, h);
                     }
                     break;
+                }
 
                 case STATE_SETTLING:
-                    vTaskDelay(pdMS_TO_TICKS(1200)); 
+                    // Pause 1 s at waypoint before advancing
+                    vTaskDelay(pdMS_TO_TICKS(1000));
                     g_state = STATE_CORRECTING;
                     break;
 
                 case STATE_CORRECTING:
                     waypoint_index++;
+                    Serial.printf("[NAV] Advancing → WP %d / %d\n",
+                                  waypoint_index, num_waypoints);
+                    WebSerial.printf("Next WP: %d / %d\n",
+                                     waypoint_index, num_waypoints);
                     if (waypoint_index >= num_waypoints) {
                         g_isMowing = false;
-                        g_state = STATE_IDLE;
-                        WebSerial.println("Mission: All Waypoints Complete.");
+                        g_state    = STATE_IDLE;
                     } else {
                         g_state = STATE_DRIVING;
                     }
                     break;
 
                 case STATE_CALIBRATING:
-                    calibrateTurnRadius();
-                    g_isMowing = false;
-                    g_state = STATE_IDLE;
+                    // Spin is initiated by /api/command calibrate
+                    // and runs until the app sends pause or resume
                     break;
             }
         } else {
             moveFunction(STOP, 0);
         }
+
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
-// --- Web Server Setup ---
-AsyncWebServer server(80);
+// --- Ultrasonic ---
+static void ultrasonicTask(void *param) {
+    (void)param;
+
+    for (;;) {
+        digitalWrite(US_TRIG_PIN, LOW);  delayMicroseconds(3);
+        digitalWrite(US_TRIG_PIN, HIGH); delayMicroseconds(10);
+        digitalWrite(US_TRIG_PIN, LOW);
+
+        long  dur  = pulseIn(US_ECHO_PIN, HIGH, 12000);
+        float dist = (dur * 0.0343f) / 2.0f / 100.0f;   // metres
+
+        bool hit = (dur > 0 && dist <= 0.5f);
+
+        if (hit && !obstacleStop) {
+            Serial.printf("[US] Obstacle at %.2fm — halting\n", dist);
+            WebSerial.printf("[US] Obstacle %.2fm\n", dist);
+        }
+
+        obstacleStop = hit;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+/*
+// --- UWB Task (disabled — field names on RangeInfrastructureResult unconfirmed) ---
+static void uwbTask(void *param) {
+    (void)param;
+    for (;;) {
+        DW1000Ng::deepSleep();
+        vTaskDelay(pdMS_TO_TICKS(g_blinkRateMs));
+        DW1000Ng::spiWakeup();
+        DW1000Ng::setEUI(EUI);
+        RangeInfrastructureResult res = DW1000NgRTLS::tagTwrLocalize(2000);
+        if (res.success) {
+            g_blinkRateMs = res.new_blink_rate;
+            // TODO: replace res.??? with correct x/y field names from DW1000NgRTLS.hpp
+            // then inject into g_posQueue as a PositionPacket
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+*/
+
+
+// =======================================================================
+// REST API  (from Sketch 1)
+// =======================================================================
+
+void setupAPI() {
+
+    // GET /api/status — full telemetry for React Native app
+    server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *req) {
+        AsyncResponseStream *res = req->beginResponseStream("application/json");
+        JsonDocument d;
+
+        xSemaphoreTake(g_posMutex, portMAX_DELAY);
+        d["x"]       = g_est.est_x;
+        d["y"]       = g_est.est_y;
+        d["heading"] = g_est.est_heading;
+        xSemaphoreGive(g_posMutex);
+
+        d["isMowing"]      = g_isMowing;
+        d["batteryLevel"]  = 100;          // placeholder
+        d["waypointIndex"] = waypoint_index;
+        d["numWaypoints"]  = num_waypoints;
+        d["obstacleStop"]  = (bool)obstacleStop;
+        d["wheelbase"]     = g_wheelBase;
+
+        serializeJson(d, *res);
+        req->send(res);
+    });
+
+    // POST /api/command
+    server.on("/api/command", HTTP_POST,
+    [](AsyncWebServerRequest *req){}, NULL,
+    [](AsyncWebServerRequest *req, uint8_t *data,
+       size_t len, size_t index, size_t total) {
+
+        if (index + len != total) return;
+
+        JsonDocument d;
+        deserializeJson(d, data);
+
+        String raw; serializeJson(d, raw);
+        Serial.println("[API] /command → " + raw);
+        WebSerial.println("[API] cmd: " + raw);
+
+        if (!d.containsKey("command")) {
+            req->send(400, "application/json", "{\"error\":\"missing command\"}");
+            return;
+        }
+
+        String c = d["command"].as<String>();
+        c.trim(); c.toLowerCase();
+
+        if (c == "resume") {
+            obstacleStop = false;
+            g_isMowing   = true;
+            g_state      = STATE_DRIVING;
+            Serial.println("[CMD] Resume mowing");
+            WebSerial.println("[CMD] Resuming");
+        }
+        else if (c == "pause") {
+            g_isMowing = false;
+            moveFunction(STOP, 0);
+            Serial.println("[CMD] Paused");
+            WebSerial.println("[CMD] Paused");
+        }
+        else if (c == "calibrate") {
+            g_state    = STATE_CALIBRATING;
+            g_isMowing = true;
+            moveFunction(RIGHT, 150);
+            Serial.println("[CMD] Calibration spin started");
+            WebSerial.println("[CMD] Calibrating...");
+        }
+        else if (c == "emergency_stop") {
+            g_isMowing   = false;
+            obstacleStop = true;
+            moveFunction(STOP, 0);
+            Serial.println("[CMD] *** EMERGENCY STOP ***");
+            WebSerial.println("[CMD] *** EMERGENCY STOP ***");
+        }
+        else {
+            Serial.println("[CMD] Unknown command: " + c);
+        }
+
+        req->send(200, "application/json", "{\"success\":true}");
+    });
+
+    // POST /api/settings — update wheelbase at runtime
+    server.on("/api/settings", HTTP_POST,
+    [](AsyncWebServerRequest *req){}, NULL,
+    [](AsyncWebServerRequest *req, uint8_t *data,
+       size_t len, size_t index, size_t total) {
+
+        if (index + len != total) return;
+
+        JsonDocument d;
+        deserializeJson(d, data);
+
+        if (d.containsKey("wheelbase")) {
+            g_wheelBase = d["wheelbase"].as<float>();
+            g_state     = STATE_IDLE;
+            moveFunction(STOP, 0);
+            Serial.printf("[SETTINGS] Wheelbase → %.4fm\n", g_wheelBase);
+            WebSerial.printf("Wheelbase updated: %.4fm\n", g_wheelBase);
+        }
+
+        req->send(200, "application/json", "{\"success\":true}");
+    });
+
+    // POST /api/field-config — set field dimensions & regenerate path
+    server.on("/api/field-config", HTTP_POST,
+    [](AsyncWebServerRequest *req){}, NULL,
+    [](AsyncWebServerRequest *req, uint8_t *data,
+       size_t len, size_t index, size_t total) {
+
+        if (index + len != total) return;
+
+        JsonDocument d;
+        deserializeJson(d, data);
+
+        if (d.containsKey("dimensions")) {
+            g_fieldWidth  = d["dimensions"]["width"].as<float>();
+            g_fieldHeight = d["dimensions"]["height"].as<float>();
+            generateMowingPath(g_fieldWidth, g_fieldHeight);
+            Serial.printf("[FIELD] %.1fm x %.1fm → %d waypoints\n",
+                          g_fieldWidth, g_fieldHeight, num_waypoints);
+            WebSerial.printf("Field %.1fx%.1f, %d wps\n",
+                             g_fieldWidth, g_fieldHeight, num_waypoints);
+        }
+
+        req->send(200, "application/json", "{\"success\":true}");
+    });
+
+    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
+    server.begin();
+    Serial.println("[API] Server started on port 80.");
+}
+
+
+// =======================================================================
+// Setup
+// =======================================================================
 
 void setup() {
     Serial.begin(115200);
+    SPI.begin(14, 12, 13, PIN_SS);
+    delay(200);
+
+    // --- GPIO ---
+    pinMode(US_TRIG_PIN,    OUTPUT);
+    pinMode(US_ECHO_PIN,    INPUT);
+    pinMode(LEFT_IN2,       OUTPUT);
+    pinMode(RIGHT_IN2,      OUTPUT);
+    ledcAttach(LEFT_IN1,    PWM_FREQ, PWM_RES);
+    ledcAttach(RIGHT_IN1,   PWM_FREQ, PWM_RES);
+    pinMode(LEFT_HALL_PIN,  INPUT_PULLUP);
+    pinMode(RIGHT_HALL_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(LEFT_HALL_PIN),  leftHallISR,  RISING);
+    attachInterrupt(digitalPinToInterrupt(RIGHT_HALL_PIN), rightHallISR, RISING);
+
+    // --- Synchronization primitives ---
     g_posMutex = xSemaphoreCreateMutex();
-    
-    SPI.begin(18, 19, 23, PIN_SS); 
-
-    // Light Emitting Diode Control (LEDC) utilized for Motor Pulse Width Modulation
-    ledcAttach(LEFT_IN1, PWM_FREQ, PWM_RES);
-    ledcAttach(RIGHT_IN1, PWM_FREQ, PWM_RES);
-    pinMode(LEFT_IN2, OUTPUT); pinMode(RIGHT_IN2, OUTPUT);
-    
-    pinMode(LEFT_HALL_PIN, INPUT_PULLUP); pinMode(RIGHT_HALL_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(LEFT_HALL_PIN), []{ g_leftPulseCount++; }, RISING);
-    attachInterrupt(digitalPinToInterrupt(RIGHT_HALL_PIN), []{ g_rightPulseCount++; }, RISING);
-
-    DW1000Ng::initializeNoInterrupt(PIN_SS, PIN_RST);
-    g_uwbInitialized = true;
-    
-    generateMowingPath(5.0, 5.0); 
-
-    WiFi.begin(SSID, PASSPHRASE);
-    uint32_t startAttempt = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000) delay(500);
-
-    // RESTful Application Programming Interface (API) Status stream
-    server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request){
-        AsyncResponseStream *response = request->beginResponseStream("application/json");
-        JsonDocument doc;
-        xSemaphoreTake(g_posMutex, portMAX_DELAY);
-        doc["isMowing"] = g_isMowing;
-        doc["x"] = g_est.x; 
-        doc["y"] = g_est.y;
-        xSemaphoreGive(g_posMutex);
-        serializeJson(doc, *response);
-        request->send(response);
-    });
-
-    // RESTful API Settings Endpoint
-    server.on("/api/settings", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL, 
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
-        if (index + len == total) {
-            JsonDocument doc; 
-            DeserializationError error = deserializeJson(doc, data);
-            
-            if (!error) {
-                // Read the incoming values if they exist in the payload
-                if (doc.containsKey("wheelbase")) g_wheelBase = doc["wheelbase"].as<float>();
-                if (doc.containsKey("fieldWidth")) g_fieldWidth = doc["fieldWidth"].as<float>();
-                if (doc.containsKey("fieldHeight")) g_fieldHeight = doc["fieldHeight"].as<float>();
-                
-                // Regenerate the waypoints with the brand new dimensions
-                generateMowingPath(g_fieldWidth, g_fieldHeight);
-                
-                Serial.printf("--- SETTINGS RECEIVED: WB=%.3f, W=%.1f, H=%.1f ---\n", 
-                              g_wheelBase, g_fieldWidth, g_fieldHeight);
-                              
-                request->send(200, "application/json", "{\"success\":true}");
-            } else {
-                request->send(400, "application/json", "{\"error\":\"Parse Failed\"}");
-            }
-        }
-    });
-
-    server.on("/api/command", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL, 
-[](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
-    if (index + len == total) {
-        JsonDocument doc; 
-        deserializeJson(doc, data);
-        
-        // 1. Force the type to String
-        String cmd = doc["command"].as<String>();
-        
-        // 2. Strip hidden newlines/spaces and standardize case
-        cmd.trim();
-        cmd.toLowerCase();
-        
-        // 3. Print with brackets so hidden spaces become visible
-        Serial.println("--- API RECEIVED: [" + cmd + "] ---");
-
-        if (cmd == "resume") { 
-            g_isMowing = true; 
-            g_state = STATE_DRIVING; 
-            obstacleStop = false; // Unlock motors
-        } else if (cmd == "pause") { 
-            g_isMowing = false; 
-        } else if (cmd == "calibrate") { 
-            g_state = STATE_CALIBRATING; 
-            g_isMowing = true; 
-            Serial.println("--- STATE SET TO CALIBRATING ---"); 
-        } else if (cmd == "emergency_stop") {
-            g_isMowing = false;
-            g_state = STATE_IDLE;
-            obstacleStop = true; // Lock motors immediately
-            moveFunction(STOP, 0); // Cut power
-            Serial.println("--- EMERGENCY STOP ACTIVATED ---");
-        } else {
-            Serial.println("--- ERROR: Unrecognized Command ---");
-        }
-        request->send(200, "application/json", "{\"success\":true}");
+    g_posQueue = xQueueCreate(10, sizeof(PositionPacket));
+    if (!g_posQueue) {
+        Serial.println("[SETUP] ERROR: Queue creation failed — halting");
+        while (true) delay(1000);
     }
-    });
-    // Dedicated endpoint for the Field Configuration button
-    server.on("/api/field-config", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL, 
-    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
-        if (index + len == total) {
-            JsonDocument doc; 
-            DeserializationError error = deserializeJson(doc, data);
-            
-            if (!error) {
-                // Read the incoming dimensions
-                if (doc.containsKey("fieldWidth")) g_fieldWidth = doc["fieldWidth"].as<float>();
-                if (doc.containsKey("fieldHeight")) g_fieldHeight = doc["fieldHeight"].as<float>();
-                
-                // Regenerate the grid with the new dimensions
-                generateMowingPath(g_fieldWidth, g_fieldHeight);
-                
-                Serial.printf("--- FIELD CONFIG SAVED: Width=%.1f, Height=%.1f ---\n", 
-                              g_fieldWidth, g_fieldHeight);
-                              
-                request->send(200, "application/json", "{\"success\":true}");
-            } else {
-                request->send(400, "application/json", "{\"error\":\"Parse Failed\"}");
-            }
-        }
-    });
-// The Catch-All handler for undefined URLs
-    server.onNotFound([](AsyncWebServerRequest *request) {
-        String method = (request->method() == HTTP_GET) ? "GET" : "POST";
-        String url = request->url();
-        
-        Serial.println("\n--- 404 NOT FOUND ERROR ---");
-        Serial.println("The app tried to reach: " + url);
-        Serial.println("Using HTTP Method: " + method);
-        Serial.println("---------------------------\n");
-        
-        request->send(404, "text/plain", "Endpoint not found");
-    });
-    server.begin();
-    
-  //  runSquareTest();
-    g_isMowing = false;
 
-    // Launch background execution loops (Tasks)
-    xTaskCreatePinnedToCore(odometryTask, "Odom", 4096, NULL, 2, NULL, 1);
-    xTaskCreatePinnedToCore(uwbTask, "UWB", 8192, NULL, 3, NULL, 1);
+    // --- Initial position state ---
+    initPositionEstimator();
+
+    // --- DW1000 (needed even with UWB task disabled — keeps hardware init consistent) ---
+    initDw1000();
+
+    // --- WiFi (AP+STA required for ESP-NOW) ---
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(SSID, PASSPHRASE);
+    Serial.print("[WiFi] Connecting");
+    while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+    Serial.println("\n[WiFi] IP: " + WiFi.localIP().toString());
+
+    // --- ESP-NOW ---
+    initEspNow();
+
+    // --- WebSerial + REST API ---
+    WebSerial.begin(&server);
+    setupAPI();
+
+    // --- Default mowing path (overridden at runtime via /api/field-config) ---
+    generateMowingPath(g_fieldWidth, g_fieldHeight);
+
+    // --- FreeRTOS Tasks ---
+    xTaskCreatePinnedToCore(PositionUpdateTask, "PosUpdate",  4096, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(ultrasonicTask,     "Ultrasonic", 4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(odometryTask,       "Odometry",   4096, NULL, 4, NULL, 1);
+    // uwbTask intentionally not started — see commented task above
+
+    Serial.println("[SETUP] Complete. Awaiting API commands.");
+    WebSerial.println("System ready. POST resume to /api/command to start.");
 }
 
 void loop() { vTaskDelete(NULL); }
